@@ -1,7 +1,7 @@
 import json
 from typing import Any
 
-from fastapi import UploadFile
+from starlette.datastructures import UploadFile
 
 
 def clean_unity_str(s: str) -> str:
