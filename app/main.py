@@ -5,7 +5,7 @@ from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
 from app.config import AVATARS_DIR
-from app.routes import detection, health
+from app.routes import detection, generation, health
 from app.services.face_detector import FaceDetector
 from app.services.pose_validator import PoseValidator
 
@@ -33,5 +33,6 @@ app = FastAPI(title="HoloBorn Mac Backend", lifespan=lifespan)
 
 app.include_router(health.router)
 app.include_router(detection.router)
+app.include_router(generation.router)
 
 app.mount("/avatars", StaticFiles(directory=str(AVATARS_DIR)), name="avatars")
