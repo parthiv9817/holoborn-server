@@ -42,7 +42,7 @@ def portraitize(image_bytes: bytes) -> bytes:
     buf.name = "input.jpg"
 
     response = client.images.edit(
-        model="gpt-image-1.5",
+        model=settings.gpt_image_model,
         image=buf,
         prompt=PORTRAIT_PROMPT,
         size="1024x1536",
