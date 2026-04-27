@@ -1,22 +1,17 @@
-import asyncio
-import base64
-import time
-import uuid
 from datetime import datetime
 
 import cv2
 from fastapi import APIRouter, HTTPException, Request
 
-from app.config import ORIGINALS_DIR, SCANS_DIR
-from app.models.generation_schemas import FramingResponse, MultiviewResponse
-from app.services.frame_decoder import decode_jpeg
-from app.services.multipart_utils import (
-    clean_unity_str,
-    collect_frames,
-    parse_metadata,
+from app.config import AVATARS_DIR, ORIGINALS_DIR
+from app.models.generation_schemas import (
+    FramingResponse,
+    MultiviewResponse,
+    TaskStatusResponse,
 )
-from app.services.portraitizer import portraitize
-from app.services.preprocessing import burst_average
+from app.services.frame_decoder import decode_jpeg
+from app.services.generation_pipeline import run_pipeline
+from app.services.multipart_utils import collect_frames, parse_metadata
 from app.services.runpod_client import RunPodClient
 
 
@@ -30,6 +25,17 @@ def _get_runpod_client(request: Request) -> RunPodClient:
         client = RunPodClient()
         state.runpod_client = client
     return client
+
+
+def _progress_for(runpod_status: str) -> int:
+    return {
+        "IN_QUEUE": 10,
+        "IN_PROGRESS": 50,
+        "COMPLETED": 100,
+        "FAILED": 0,
+        "CANCELLED": 0,
+        "TIMED_OUT": 0,
+    }.get(runpod_status.upper(), 25)
 
 
 @router.post("/validate-frame", response_model=FramingResponse)
@@ -53,7 +59,7 @@ async def validate_frame(request: Request) -> FramingResponse:
     print(
         f"[validate-frame] framing={result['framing']} "
         f"landmarks={result['landmarks_detected']} "
-        f"elapsed={result['processing_time_ms']:.1f}ms saved={out_path.name}"
+        f"elapsed={result['processing_time_ms']:.1f}ms"
     )
 
     return FramingResponse(**result)
@@ -66,74 +72,90 @@ async def generate_multiview(request: Request) -> MultiviewResponse:
     if not frames:
         raise HTTPException(status_code=400, detail="no frame_* fields found")
 
-    metadata_raw = form.get("metadata")
-    metadata: list[dict] = []
+    metadata_raw = form.get("metadata") or ""
     if isinstance(metadata_raw, str) and metadata_raw:
         try:
-            metadata = parse_metadata(metadata_raw)
+            parse_metadata(metadata_raw)
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"bad metadata: {e}") from e
 
-    task_id = str(uuid.uuid4())
-    ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-    scan_dir = SCANS_DIR / f"{ts}_{task_id[:8]}"
-    scan_dir.mkdir(parents=True, exist_ok=True)
-
-    for name, raw in zip(names, frames):
-        (scan_dir / f"{name}.jpg").write_bytes(raw)
-    if metadata:
-        (scan_dir / "metadata.json").write_text(clean_unity_str(metadata_raw or ""))
-
-    print(f"[generate-multiview] task={task_id} frames={len(frames)} dir={scan_dir.name}")
-
-    t0 = time.perf_counter()
-    averaged = burst_average(frames)
-    avg_path = scan_dir / "averaged.jpg"
-    cv2.imwrite(str(avg_path), averaged)
-    t_avg = time.perf_counter() - t0
-    print(f"[generate-multiview] burst_avg elapsed={t_avg:.2f}s shape={averaged.shape}")
-
-    ok, encoded = cv2.imencode(".jpg", averaged, [cv2.IMWRITE_JPEG_QUALITY, 95])
-    if not ok:
-        raise HTTPException(status_code=500, detail="failed to encode averaged frame")
-    averaged_jpeg = encoded.tobytes()
-
-    t1 = time.perf_counter()
-    try:
-        portrait_bytes = await asyncio.to_thread(portraitize, averaged_jpeg)
-    except Exception as e:
-        print(f"[generate-multiview] portraitize failed: {e}")
-        raise HTTPException(status_code=502, detail=f"portraitize failed: {e}") from e
-    t_portrait = time.perf_counter() - t1
-    print(f"[generate-multiview] portraitize elapsed={t_portrait:.2f}s bytes={len(portrait_bytes)}")
-
-    portrait_path = scan_dir / "portrait.png"
-    portrait_path.write_bytes(portrait_bytes)
-
-    image_b64 = base64.b64encode(portrait_bytes).decode("ascii")
-
     runpod = _get_runpod_client(request)
-    t2 = time.perf_counter()
     try:
-        job_id = await runpod.submit_job(image_b64)
+        task_id, _job_id, task_record = await run_pipeline(
+            frames, names, metadata_raw if isinstance(metadata_raw, str) else "", runpod
+        )
     except Exception as e:
-        print(f"[generate-multiview] runpod submit failed: {e}")
-        raise HTTPException(status_code=502, detail=f"runpod submit failed: {e}") from e
-    t_submit = time.perf_counter() - t2
-    print(f"[generate-multiview] runpod submitted job={job_id} elapsed={t_submit:.2f}s")
+        print(f"[generate-multiview] pipeline failed: {e}")
+        raise HTTPException(status_code=502, detail=f"pipeline failed: {e}") from e
 
-    request.app.state.generation_tasks[task_id] = {
-        "job_id": job_id,
-        "scan_dir": str(scan_dir),
-        "submitted_at": time.time(),
-        "status": "processing",
-        "glb_path": None,
-        "last_runpod_status": "IN_QUEUE",
-    }
-
+    request.app.state.generation_tasks[task_id] = task_record
     return MultiviewResponse(
         status="processing",
         task_id=task_id,
         frames_received=len(frames),
         message="job submitted to runpod",
+    )
+
+
+@router.get("/generate/{task_id}/status", response_model=TaskStatusResponse)
+async def task_status(task_id: str, request: Request) -> TaskStatusResponse:
+    tasks = request.app.state.generation_tasks
+    task = tasks.get(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="unknown task_id")
+
+    glb_url = f"/avatars/{task_id}.glb"
+    glb_path = AVATARS_DIR / f"{task_id}.glb"
+
+    if task.get("status") == "complete" and glb_path.exists():
+        return TaskStatusResponse(status="complete", progress=100, glb_url=glb_url)
+
+    if task.get("status") == "failed":
+        return TaskStatusResponse(
+            status="failed",
+            progress=0,
+            message=task.get("error", "runpod job failed"),
+        )
+
+    runpod = _get_runpod_client(request)
+    job_id = task["job_id"]
+    try:
+        rp_status = await runpod.get_job_status(job_id)
+    except Exception as e:
+        print(f"[status] runpod poll error task={task_id}: {e}")
+        return TaskStatusResponse(
+            status="processing",
+            progress=_progress_for(task.get("last_runpod_status", "IN_QUEUE")),
+            glb_url=glb_url,
+            message=f"poll error: {e}",
+        )
+
+    state = (rp_status.get("status") or "IN_QUEUE").upper()
+    task["last_runpod_status"] = state
+
+    if state == "COMPLETED":
+        output = rp_status.get("output") or {}
+        try:
+            saved = await runpod.download_glb(output, task_id)
+        except Exception as e:
+            task["status"] = "failed"
+            task["error"] = f"glb download failed: {e}"
+            print(f"[status] glb download failed task={task_id}: {e}")
+            return TaskStatusResponse(status="failed", progress=0, message=task["error"])
+
+        task["status"] = "complete"
+        task["glb_path"] = str(saved)
+        print(f"[status] task={task_id} complete -> {saved.name} ({saved.stat().st_size} bytes)")
+        return TaskStatusResponse(status="complete", progress=100, glb_url=glb_url)
+
+    if state in {"FAILED", "CANCELLED", "TIMED_OUT"}:
+        task["status"] = "failed"
+        task["error"] = rp_status.get("error") or state.lower()
+        return TaskStatusResponse(status="failed", progress=0, message=task["error"])
+
+    return TaskStatusResponse(
+        status="processing",
+        progress=_progress_for(state),
+        glb_url=glb_url,
+        message=state.lower(),
     )
