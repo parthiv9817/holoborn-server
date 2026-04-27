@@ -1,41 +1,37 @@
+import asyncio
+import logging
+import time
+import uuid
 from datetime import datetime
 
 import cv2
 from fastapi import APIRouter, HTTPException, Request
 
-from app.config import AVATARS_DIR, ORIGINALS_DIR
+from app.config import AVATARS_DIR, ORIGINALS_DIR, SCANS_DIR
 from app.models.generation_schemas import (
     FramingResponse,
     MultiviewResponse,
     TaskStatusResponse,
 )
 from app.services.frame_decoder import decode_jpeg
-from app.services.generation_pipeline import run_pipeline
-from app.services.multipart_utils import collect_frames, parse_metadata
-from app.services.runpod_client import RunPodClient
+from app.services.generation_pipeline import process_task
+from app.services.multipart_utils import (
+    clean_unity_str,
+    collect_frames,
+    parse_metadata,
+)
+from app.services.preprocessing import burst_average
 
 
 router = APIRouter()
+log = logging.getLogger(__name__)
 
 
-def _get_runpod_client(request: Request) -> RunPodClient:
-    state = request.app.state
-    client = getattr(state, "runpod_client", None)
-    if client is None:
-        client = RunPodClient()
-        state.runpod_client = client
-    return client
-
-
-def _progress_for(runpod_status: str) -> int:
-    return {
-        "IN_QUEUE": 10,
-        "IN_PROGRESS": 50,
-        "COMPLETED": 100,
-        "FAILED": 0,
-        "CANCELLED": 0,
-        "TIMED_OUT": 0,
-    }.get(runpod_status.upper(), 25)
+_PROGRESS_BY_RUNPOD_STATE = {
+    "IN_QUEUE": 25,
+    "IN_PROGRESS": 60,
+    "COMPLETED": 100,
+}
 
 
 @router.post("/validate-frame", response_model=FramingResponse)
@@ -56,12 +52,10 @@ async def validate_frame(request: Request) -> FramingResponse:
     out_path = ORIGINALS_DIR / f"validate_{ts}_{result['framing']}.jpg"
     cv2.imwrite(str(out_path), frame)
 
-    print(
-        f"[validate-frame] framing={result['framing']} "
-        f"landmarks={result['landmarks_detected']} "
-        f"elapsed={result['processing_time_ms']:.1f}ms"
+    log.info(
+        "validate-frame framing=%s landmarks=%d elapsed=%.1fms",
+        result["framing"], result["landmarks_detected"], result["processing_time_ms"],
     )
-
     return FramingResponse(**result)
 
 
@@ -79,21 +73,47 @@ async def generate_multiview(request: Request) -> MultiviewResponse:
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"bad metadata: {e}") from e
 
-    runpod = _get_runpod_client(request)
-    try:
-        task_id, _job_id, task_record = await run_pipeline(
-            frames, names, metadata_raw if isinstance(metadata_raw, str) else "", runpod
-        )
-    except Exception as e:
-        print(f"[generate-multiview] pipeline failed: {e}")
-        raise HTTPException(status_code=502, detail=f"pipeline failed: {e}") from e
+    task_id = str(uuid.uuid4())
+    ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    scan_dir = SCANS_DIR / f"{ts}_{task_id[:8]}"
+    scan_dir.mkdir(parents=True, exist_ok=True)
 
+    for name, raw in zip(names, frames):
+        (scan_dir / f"{name}.jpg").write_bytes(raw)
+    if isinstance(metadata_raw, str) and metadata_raw:
+        (scan_dir / "metadata.json").write_text(clean_unity_str(metadata_raw))
+
+    t0 = time.perf_counter()
+    averaged = burst_average(frames)
+    cv2.imwrite(str(scan_dir / "averaged.jpg"), averaged)
+    log.info(
+        "[task %s] burst_avg elapsed=%.2fs shape=%s frames=%d",
+        task_id, time.perf_counter() - t0, averaged.shape, len(frames),
+    )
+
+    ok, encoded = cv2.imencode(".jpg", averaged, [cv2.IMWRITE_JPEG_QUALITY, 95])
+    if not ok:
+        raise HTTPException(status_code=500, detail="failed to encode averaged frame")
+    averaged_jpeg = encoded.tobytes()
+
+    task_record = {
+        "status": "processing",
+        "submitted_at": time.time(),
+        "scan_dir": str(scan_dir),
+        "job_id": None,
+        "last_runpod_status": "PENDING",
+        "glb_path": None,
+        "error": None,
+    }
     request.app.state.generation_tasks[task_id] = task_record
+
+    asyncio.create_task(process_task(task_id, averaged_jpeg, scan_dir, task_record))
+
     return MultiviewResponse(
         status="processing",
         task_id=task_id,
         frames_received=len(frames),
-        message="job submitted to runpod",
+        message="job accepted",
     )
 
 
@@ -107,55 +127,22 @@ async def task_status(task_id: str, request: Request) -> TaskStatusResponse:
     glb_url = f"/avatars/{task_id}.glb"
     glb_path = AVATARS_DIR / f"{task_id}.glb"
 
-    if task.get("status") == "complete" and glb_path.exists():
+    status = task.get("status", "processing")
+    if status == "complete" and glb_path.exists():
         return TaskStatusResponse(status="complete", progress=100, glb_url=glb_url)
 
-    if task.get("status") == "failed":
+    if status == "failed":
         return TaskStatusResponse(
             status="failed",
             progress=0,
-            message=task.get("error", "runpod job failed"),
+            message=task.get("error") or "task failed",
         )
 
-    runpod = _get_runpod_client(request)
-    job_id = task["job_id"]
-    try:
-        rp_status = await runpod.get_job_status(job_id)
-    except Exception as e:
-        print(f"[status] runpod poll error task={task_id}: {e}")
-        return TaskStatusResponse(
-            status="processing",
-            progress=_progress_for(task.get("last_runpod_status", "IN_QUEUE")),
-            glb_url=glb_url,
-            message=f"poll error: {e}",
-        )
-
-    state = (rp_status.get("status") or "IN_QUEUE").upper()
-    task["last_runpod_status"] = state
-
-    if state == "COMPLETED":
-        output = rp_status.get("output") or {}
-        try:
-            saved = await runpod.download_glb(output, task_id)
-        except Exception as e:
-            task["status"] = "failed"
-            task["error"] = f"glb download failed: {e}"
-            print(f"[status] glb download failed task={task_id}: {e}")
-            return TaskStatusResponse(status="failed", progress=0, message=task["error"])
-
-        task["status"] = "complete"
-        task["glb_path"] = str(saved)
-        print(f"[status] task={task_id} complete -> {saved.name} ({saved.stat().st_size} bytes)")
-        return TaskStatusResponse(status="complete", progress=100, glb_url=glb_url)
-
-    if state in {"FAILED", "CANCELLED", "TIMED_OUT"}:
-        task["status"] = "failed"
-        task["error"] = rp_status.get("error") or state.lower()
-        return TaskStatusResponse(status="failed", progress=0, message=task["error"])
-
+    rp_state = (task.get("last_runpod_status") or "PENDING").upper()
+    progress = _PROGRESS_BY_RUNPOD_STATE.get(rp_state, 10)
     return TaskStatusResponse(
         status="processing",
-        progress=_progress_for(state),
+        progress=progress,
         glb_url=glb_url,
-        message=state.lower(),
+        message=rp_state.lower(),
     )
