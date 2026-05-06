@@ -8,6 +8,7 @@ RESULTS_DIR = PROJECT_ROOT / "results"
 AVATARS_DIR = RESULTS_DIR / "avatars"
 ORIGINALS_DIR = RESULTS_DIR / "originals"
 SCANS_DIR = RESULTS_DIR / "scans"
+QUEST_TEST_UPLOADS_DIR = RESULTS_DIR / "quest_test_uploads"
 
 
 class Settings(BaseSettings):
@@ -39,6 +40,8 @@ class Settings(BaseSettings):
     port: int = 8000
     log_level: str = "info"
 
+    quest_test_mode: bool = True
+
     @property
     def runpod_run_url(self) -> str:
         return f"{self.gpu_server_url}/run"
@@ -55,5 +58,5 @@ def get_settings() -> Settings:
     return settings
 
 
-for _d in (AVATARS_DIR, ORIGINALS_DIR, SCANS_DIR):
+for _d in (AVATARS_DIR, ORIGINALS_DIR, SCANS_DIR, QUEST_TEST_UPLOADS_DIR):
     _d.mkdir(parents=True, exist_ok=True)

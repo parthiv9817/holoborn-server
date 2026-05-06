@@ -7,7 +7,7 @@ from datetime import datetime
 import cv2
 from fastapi import APIRouter, HTTPException, Request
 
-from app.config import AVATARS_DIR, ORIGINALS_DIR, SCANS_DIR
+from app.config import AVATARS_DIR, ORIGINALS_DIR, QUEST_TEST_UPLOADS_DIR, SCANS_DIR, settings
 from app.models.generation_schemas import (
     FramingResponse,
     MultiviewResponse,
@@ -40,6 +40,13 @@ async def validate_frame(request: Request) -> FramingResponse:
     if not data:
         raise HTTPException(status_code=400, detail="empty body")
 
+    if settings.quest_test_mode:
+        ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S_%f")
+        out_path = QUEST_TEST_UPLOADS_DIR / f"validate_{ts}.jpg"
+        out_path.write_bytes(data)
+        log.info("[quest-test] /validate-frame received %d bytes -> %s", len(data), out_path.name)
+        return FramingResponse(framing="good", message="quest-test mode: bytes saved", landmarks_detected=33)
+
     try:
         frame = decode_jpeg(data)
     except ValueError as e:
@@ -67,6 +74,32 @@ async def generate_multiview(request: Request) -> MultiviewResponse:
         raise HTTPException(status_code=400, detail="no frame_* fields found")
 
     metadata_raw = form.get("metadata") or ""
+
+    if settings.quest_test_mode:
+        task_id = str(uuid.uuid4())
+        ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        scan_dir = QUEST_TEST_UPLOADS_DIR / f"multiview_{ts}_{task_id[:8]}"
+        scan_dir.mkdir(parents=True, exist_ok=True)
+
+        total_bytes = 0
+        for name, raw in zip(names, frames):
+            (scan_dir / f"{name}.jpg").write_bytes(raw)
+            total_bytes += len(raw)
+        if isinstance(metadata_raw, str) and metadata_raw:
+            (scan_dir / "metadata.json").write_text(clean_unity_str(metadata_raw))
+
+        request.app.state.generation_tasks[task_id] = {"status": "complete"}
+        log.info(
+            "[quest-test] /generate-multiview received %d frames (%d bytes) -> %s",
+            len(frames), total_bytes, scan_dir.name,
+        )
+        return MultiviewResponse(
+            status="processing",
+            task_id=task_id,
+            frames_received=len(frames),
+            message="quest-test mode: frames saved, no GPU pipeline triggered",
+        )
+
     if isinstance(metadata_raw, str) and metadata_raw:
         try:
             parse_metadata(metadata_raw)
@@ -123,6 +156,13 @@ async def task_status(task_id: str, request: Request) -> TaskStatusResponse:
     task = tasks.get(task_id)
     if task is None:
         raise HTTPException(status_code=404, detail="unknown task_id")
+
+    if settings.quest_test_mode:
+        return TaskStatusResponse(
+            status="failed",
+            progress=0,
+            message="quest-test mode: GPU pipeline disabled, no GLB will be produced",
+        )
 
     glb_url = f"/avatars/{task_id}.glb"
     glb_path = AVATARS_DIR / f"{task_id}.glb"

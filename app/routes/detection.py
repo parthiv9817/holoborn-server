@@ -1,10 +1,15 @@
+import logging
+from datetime import datetime
+
 from fastapi import APIRouter, HTTPException, Request, UploadFile
 
+from app.config import QUEST_TEST_UPLOADS_DIR, settings
 from app.models.schemas import DetectionResponse
 from app.services.frame_decoder import decode_jpeg
 
 
 router = APIRouter()
+log = logging.getLogger(__name__)
 
 
 async def _read_image(request: Request) -> bytes:
@@ -23,6 +28,15 @@ async def detect(request: Request) -> DetectionResponse:
     data = await _read_image(request)
     if not data:
         raise HTTPException(status_code=400, detail="empty body")
+
+    if settings.quest_test_mode:
+        ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S_%f")
+        out_path = QUEST_TEST_UPLOADS_DIR / f"detect_{ts}.jpg"
+        out_path.write_bytes(data)
+        log.info("[quest-test] /detect received %d bytes -> %s", len(data), out_path.name)
+        state = request.app.state
+        state.frames_processed = getattr(state, "frames_processed", 0) + 1
+        return DetectionResponse(detected=False, face_count=0, faces=[], frame_number=state.frames_processed, processing_time_ms=0.0)
 
     try:
         frame = decode_jpeg(data)
