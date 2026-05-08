@@ -24,6 +24,20 @@ class MultiviewResponse(BaseModel):
 
 
 class TaskStatusResponse(BaseModel):
+    """Status response for /generate/{task_id}/status.
+
+    `status` values, in pipeline order:
+      "processing"     legacy alias, kept for backwards compat
+      "portraitizing"  OpenAI gpt-image-1.5 portrait edit in flight
+      "generating"     RunPod TRELLIS generation in flight (progress 0-100)
+      "rigging"        Meshy auto-rig in flight (when wired)
+      "animating"      Meshy animation bake in flight (when wired)
+      "complete"       GLB ready at glb_url
+      "failed"         pipeline failure, see message
+
+    Quest's SpawnRitualController maps these to 5 visual phases (P1-P5).
+    """
+
     status: str = "processing"
     progress: int = 0
     glb_url: str = ""

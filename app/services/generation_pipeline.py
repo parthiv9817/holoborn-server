@@ -36,6 +36,7 @@ async def process_task(
     Mutates task_record in place to communicate progress/status to /status route.
     """
     try:
+        task_record["status"] = "portraitizing"
         t1 = time.perf_counter()
         portrait_bytes = await _portraitize_async(averaged_jpeg)
         log.info(
@@ -47,6 +48,7 @@ async def process_task(
 
         image_b64 = base64.b64encode(portrait_bytes).decode("ascii")
 
+        task_record["status"] = "generating"
         t2 = time.perf_counter()
         runpod_job_id = await submit_job(image_b64)
         task_record["job_id"] = runpod_job_id

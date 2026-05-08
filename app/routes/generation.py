@@ -168,6 +168,7 @@ async def task_status(task_id: str, request: Request) -> TaskStatusResponse:
     glb_path = AVATARS_DIR / f"{task_id}.glb"
 
     status = task.get("status", "processing")
+
     if status == "complete" and glb_path.exists():
         return TaskStatusResponse(status="complete", progress=100, glb_url=glb_url)
 
@@ -176,6 +177,19 @@ async def task_status(task_id: str, request: Request) -> TaskStatusResponse:
             status="failed",
             progress=0,
             message=task.get("error") or "task failed",
+        )
+
+    if status in ("portraitizing", "rigging", "animating"):
+        return TaskStatusResponse(status=status, progress=0, glb_url=glb_url)
+
+    if status == "generating":
+        rp_state = (task.get("last_runpod_status") or "PENDING").upper()
+        progress = _PROGRESS_BY_RUNPOD_STATE.get(rp_state, 10)
+        return TaskStatusResponse(
+            status="generating",
+            progress=progress,
+            glb_url=glb_url,
+            message=rp_state.lower(),
         )
 
     rp_state = (task.get("last_runpod_status") or "PENDING").upper()
