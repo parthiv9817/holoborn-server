@@ -11,6 +11,44 @@ SCANS_DIR = RESULTS_DIR / "scans"
 QUEST_TEST_UPLOADS_DIR = RESULTS_DIR / "quest_test_uploads"
 
 
+# TRELLIS sampler presets — sent to GPU handler as input-dict overrides.
+# `fast` matches the GPU handler's hardcoded defaults (validated 2026-05-07,
+# produced the 28.3MB GLB that rigged cleanly on Meshy).
+# `demo_premium` is the locked tune from the 2026-05-06 second-opinion brief,
+# tuned for organic humans per fal.ai parameter guide + TRELLIS issue #92.
+TRELLIS_PRESETS: dict[str, dict[str, float | int]] = {
+    "fast": {
+        "sparse_struct_guidance": 8.0,
+        "sparse_struct_steps": 12,
+        "shape_slat_guidance": 8.0,
+        "shape_slat_steps": 12,
+        "tex_slat_guidance": 1.0,
+        "tex_slat_steps": 12,
+        "decimation": 50000,
+    },
+    "demo_premium": {
+        "sparse_struct_guidance": 6.5,
+        "sparse_struct_steps": 18,
+        "shape_slat_guidance": 4.75,
+        "shape_slat_steps": 18,
+        "tex_slat_guidance": 3.0,
+        "tex_slat_steps": 18,
+        "decimation": 200000,
+    },
+    # demo_max: pushes guidance + steps to fal.ai range endpoints, keeps decimation
+    # at Quest-safe 200k. ~22% more compute than demo_premium. No on-device perf risk.
+    "demo_max": {
+        "sparse_struct_guidance": 7.0,
+        "sparse_struct_steps": 22,
+        "shape_slat_guidance": 4.0,
+        "shape_slat_steps": 22,
+        "tex_slat_guidance": 3.5,
+        "tex_slat_steps": 22,
+        "decimation": 200000,
+    },
+}
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=PROJECT_ROOT / ".env",

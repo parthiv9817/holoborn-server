@@ -5,10 +5,12 @@ Bypasses OpenAI portraitizer step. Uses the same runpod_client.py production cod
 Usage:
     source .venv/bin/activate
     python tests/scripts/test_runpod_manual.py path/to/portrait.png
-    # or with the burst-averaged fixture as input:
+    # with a TRELLIS preset (defined in app/config.TRELLIS_PRESETS):
+    python tests/scripts/test_runpod_manual.py path/to/portrait.png demo_premium
+    # with the burst-averaged fixture as input:
     python tests/scripts/test_runpod_manual.py tests/outputs/burst_average/averaged.jpg
 
-Default output: tests/outputs/runpod_glbs/manual_test_<timestamp>.glb
+Default output: tests/outputs/runpod_glbs/manual_test_<preset>_<timestamp>.glb
 """
 from __future__ import annotations
 
@@ -22,6 +24,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 
+from app.config import TRELLIS_PRESETS  # noqa: E402
 from app.services.runpod_client import (  # noqa: E402
     GlbDownloadError,
     RunpodJobError,
@@ -35,13 +38,28 @@ DEFAULT_INPUT = REPO_ROOT / "tests" / "outputs" / "burst_average" / "averaged.jp
 GLB_OUT_DIR = REPO_ROOT / "tests" / "outputs" / "runpod_glbs"
 
 
-async def run(input_path: Path) -> None:
+async def run(input_path: Path, preset_name: str | None) -> None:
     if not input_path.exists():
         sys.exit(f"❌ Input file not found: {input_path}")
+
+    preset_kwargs: dict[str, float | int] = {}
+    preset_label = "default"
+    if preset_name:
+        if preset_name not in TRELLIS_PRESETS:
+            sys.exit(
+                f"❌ Unknown preset '{preset_name}'. "
+                f"Available: {list(TRELLIS_PRESETS.keys())}"
+            )
+        preset_kwargs = dict(TRELLIS_PRESETS[preset_name])
+        preset_label = preset_name
 
     img_bytes = input_path.read_bytes()
     print(f"📷 Input: {input_path}  ({len(img_bytes):,} bytes)")
     print(f"   First 4 bytes: {img_bytes[:4]!r}")
+    print(f"🎛️  Preset: {preset_label}")
+    if preset_kwargs:
+        for k, v in preset_kwargs.items():
+            print(f"     {k} = {v}")
 
     image_b64 = base64.b64encode(img_bytes).decode("ascii")
     print(f"   Base64 length: {len(image_b64):,} chars")
@@ -49,7 +67,7 @@ async def run(input_path: Path) -> None:
     print()
     print("⏳ Submitting RunPod job ...")
     t0 = time.perf_counter()
-    job_id = await submit_job(image_b64)
+    job_id = await submit_job(image_b64, **preset_kwargs)
     print(f"✅ Job submitted: {job_id}  (took {time.perf_counter()-t0:.2f}s)")
 
     print()
@@ -70,7 +88,7 @@ async def run(input_path: Path) -> None:
 
     GLB_OUT_DIR.mkdir(parents=True, exist_ok=True)
     ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-    local_glb = GLB_OUT_DIR / f"manual_test_{ts}.glb"
+    local_glb = GLB_OUT_DIR / f"manual_test_{preset_label}_{ts}.glb"
     print()
     print(f"⏳ Downloading GLB from S3 ({glb_volume_path}) → {local_glb}")
     t1 = time.perf_counter()
@@ -94,8 +112,9 @@ async def run(input_path: Path) -> None:
 
 def main() -> None:
     input_arg = sys.argv[1] if len(sys.argv) > 1 else str(DEFAULT_INPUT)
+    preset_arg = sys.argv[2] if len(sys.argv) > 2 else None
     input_path = Path(input_arg).resolve()
-    asyncio.run(run(input_path))
+    asyncio.run(run(input_path, preset_arg))
 
 
 if __name__ == "__main__":

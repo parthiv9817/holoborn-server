@@ -4,9 +4,9 @@ This file tracks every revision of the GPT Image portraitizer prompt used by `ap
 
 ---
 
-## Active version: **V2** (set 2026-05-04)
+## Active version: **V3** (set 2026-05-07)
 
-V2 lives in `app/services/portraitizer.py` as `PORTRAIT_PROMPT_V2`. The constant `PORTRAIT_PROMPT = PORTRAIT_PROMPT_V2` is what the live code calls. To revert, change one line: `PORTRAIT_PROMPT = PORTRAIT_PROMPT_V1`.
+V3 lives in `app/services/portraitizer.py` as `PORTRAIT_PROMPT_V3`. The constant `PORTRAIT_PROMPT = PORTRAIT_PROMPT_V3` is what the live code calls. To revert: `PORTRAIT_PROMPT = PORTRAIT_PROMPT_V2` (or V1).
 
 ---
 
@@ -101,13 +101,97 @@ client.images.edit(
 
 ### Empirical result for V2
 
-**TBD** — will test once OpenAI billing limit is lifted.
+**Skipped to V3** — V2 was never API-tested (OpenAI billing remained blocked through May 7). V3 superseded V2 on 2026-05-07 once the auto-rigging hypothesis was prioritized over pure identity preservation.
 
-Test plan when unblocked:
-1. Same input frame: `frame_0.jpg` from `results/quest_test_uploads/multiview_20260504_070012_572dbcad/`
-2. Same model: `gpt-image-2-2026-04-21` (latest accessible)
-3. Compare V2 output side-by-side with V1 output (the May 4 manual ChatGPT test) and the source frame
-4. Score: identity preservation, outfit fidelity, body proportions, drift on hairline/skin
+V2 stays in `portraitizer.py` as a fallback option (preserves the pose of the input — useful if input is already in canonical pose).
+
+---
+
+## V3 — A-pose conditioning for downstream auto-rigging (set 2026-05-07)
+
+```
+Generate a new full-body documentary photograph of the person from this image,
+standing in a clean A-pose for 3D scanning.
+
+Identity: same face, same eye shape and colour, same skin tone, same facial
+hair, same hairstyle and density, same age, neutral relaxed expression.
+Real skin texture with visible pores and natural asymmetry. Same body
+proportions and limb lengths.
+
+Clothing: same shirt with the same pattern and same colours, same jeans
+with the same colour and fit, same lanyard around the neck with the same
+badge attached, same footwear. Preserve fabric weave and texture; do not
+flatten patterns into solid colour.
+
+Pose, limb by limb:
+- Body and head facing the camera directly.
+- Both arms extended approximately 30 to 40 degrees away from the torso,
+reaching toward the LEFT and RIGHT edges of the image. Arms NOT touching
+the ribs or hips. Palms facing the thighs, fingers relaxed and slightly
+curled.
+- Both feet placed shoulder-width apart on the floor, NOT touching each
+other, toes pointing forward toward the camera.
+- Both legs straight but not locked, knees facing forward.
+- Shoulders level, spine straight, weight even on both feet.
+- Full body visible from the top of the head to the toes of both feet.
+
+Background: plain seamless light-grey backdrop, RGB approximately
+240,240,240. Subject centred horizontally and vertically. Slight headroom
+above the head, slight floor visible below the feet.
+
+Lighting: soft diffuse front key light, gentle fill from both sides, even
+illumination across the body. No harsh shadows, no rim glow, no halo, no
+coloured gels. Match the natural skin tone of the input photo; do not warm
+or cool the colour temperature.
+
+Style: shot on Hasselblad X2D with a 50mm lens, eye-level, f/8. Honest
+documentary photograph, photorealistic. Real fabric texture, real skin
+texture, natural shadow falloff. No retouching, no jaw sharpening, no eye
+enlargement, no skin smoothing, no idealization. Not illustrated, not
+painted, not stylised, not anime, not cartoon.
+
+Do not add accessories, text, logos, or watermarks that are not present
+in the input image.
+```
+
+**Length:** ~2200 chars · **Status:** ACTIVE (locked 2026-05-07)
+
+### What V3 changes (vs V2)
+
+| V3 change | Why |
+|---|---|
+| Reframes from "edit this photo" to **"Generate a new full-body documentary photograph"** | Empirical finding (north-47.com): generation-frame outperforms edit-frame for major pose changes. Edit-frame biases toward preserving input pose. |
+| **Pose, limb by limb** explicit specification | Per-limb physical-state prose beats pose-name. "Both arms extended approximately 30 to 40 degrees away from the torso" works; "stand in A-pose" fails. (Threads/Nano Banana community finding.) |
+| **Image-space directions** ("LEFT and RIGHT edges of the image") | Body-relative directions ("his right") fail because the model can't reliably resolve viewpoint. Image-space is unambiguous. |
+| Drops V2's "Make ONLY ONE change: replace background" | V3 makes multiple changes (pose + lighting + background). Locking to "one change" prevents the pose change. |
+| **Anti-stylization vocabulary expanded** to ban "anime, cartoon" explicitly | Charlie Hills + community finding: stylization triggers leak even with "photorealistic" anchor. |
+| Camera spec upgraded: **Hasselblad X2D 50mm f/8** | Specific camera anchors realism better than generic "35mm." |
+| Pose specifies **A-pose** (not T-pose) | Industry preference: A-pose has natural arm-torso separation; T-pose creates unnatural armpit topology that deforms badly during animation. |
+| **For 3D scanning** framing in opening | Subtly tells the model the output's downstream purpose, biasing toward TRELLIS-friendly silhouette (clean limb separation, front-facing). |
+
+### Empirical result for V3 (2026-05-07)
+
+**Tested with ChatGPT web UI** (OpenAI billing still blocked, used web UI as workaround). Two inputs:
+1. `tests/inputs/burst_5frames_quest_20260504/frame_0.jpg` — Quest single frame (dim ambient)
+2. `results/originals/validate_20260506_074228_732813_bad.jpg` — face-occluded validate frame (bad input)
+
+**Pose:** ✅ Both outputs achieved A-pose with arms 30-40° out, feet apart, body topology separable. Hypothesis target hit.
+
+**Identity:** ⚠️ ~50% drift on the face for input 1, ~0% (impossible to assess) for input 2. Drift is concentrated in the face — features visible but eyes narrowed, jaw more angular, hair texture shifted. Body identity (proportions, build) preserved well.
+
+**Clothing:** ✅ ~85% preserved — shirt pattern, lanyard, jeans, footwear all carried through. Slight badge-text simplification.
+
+**Downstream rigging quality:** ✅ ✅ ✅ The whole point. Portrait A → RunPod → 28.3 MB GLB → Meshy auto-marker placement worked first try (all 14 skeleton markers correctly placed) → idle/walk animation played cleanly with NO wing-pants deformation. Architectural hypothesis empirically validated.
+
+**Important caveat on identity drift:** the input frames had degraded face data (dim lighting on input 1, face occluded on input 2). Garbage-in-garbage-out is part of the failure. Future test on burst-averaged or deliberately well-lit input expected to reduce face drift significantly.
+
+### V3 sources
+
+- [north-47.com — selfie-to-studio Nano Banana pipeline](https://www.north-47.com/from-selfie-to-studio-shot-with-ai-to-standardized-corporate-employee-photos/) — generation-frame > edit-frame, image-space directions, affirmative > negative constraints
+- [Threads — Nano Banana Pro pose-change prompt](https://www.threads.com/@prompts_.gpt/post/DWV2jShkcNe/) — per-limb physical-state prose pattern
+- [binaryverseai — Drift Shield + one-change rule](https://binaryverseai.com/gpt-image-1-5-guide-consistency-api-pricing-tips/) — what NOT to write
+- [OpenAI Cookbook — gpt-image-1.5 prompting guide](https://developers.openai.com/cookbook/examples/multimodal/image-gen-1.5-prompting_guide) — Virtual Try-On exemplar adapted for pose change
+- Community-research synthesis (parallel agent run 2026-05-07) — identity-preservation ceiling realistic at 85-95%, clothing 60-75%, pose 50-70%, all-three-in-one-shot ~30-50%
 
 ---
 
