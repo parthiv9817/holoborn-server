@@ -2,12 +2,19 @@ import asyncio
 import base64
 import logging
 import shutil
+import sys
 import time
 from pathlib import Path
 
 import cv2
+import httpx
 
 from app.config import AVATARS_DIR, settings
+from app.services.meshy_animation_client import (
+    extract_rigged_glb_url,
+    poll_rigging_until_complete,
+    submit_rigging,
+)
 from app.services.meshy_client import (
     MeshyDownloadError,
     MeshyJobError,
@@ -26,6 +33,24 @@ from app.services.runpod_client import (
     poll_until_complete,
     submit_job,
 )
+
+# tools/graft_pbr_materials.py — restores PBR materials onto rigged GLB
+# (Meshy rigging strips the metallic/roughness/normal/emissive textures;
+# graft re-bakes them from the retex source). Imported lazily by adding
+# the repo root to sys.path the first time it's needed.
+_GRAFT_FN = None
+
+
+def _graft_pbr():
+    global _GRAFT_FN
+    if _GRAFT_FN is not None:
+        return _GRAFT_FN
+    repo_root = Path(__file__).resolve().parent.parent.parent
+    if str(repo_root) not in sys.path:
+        sys.path.insert(0, str(repo_root))
+    from tools.graft_pbr_materials import graft  # type: ignore[import-not-found]
+    _GRAFT_FN = graft
+    return _GRAFT_FN
 
 
 log = logging.getLogger(__name__)
@@ -180,16 +205,123 @@ async def process_task(
                 task_id, final_path.name, clean_size, time.perf_counter() - t7,
             )
 
-            # Cleanup intermediates — Quest only needs the final clean GLB.
+            # Cleanup retex intermediates (TRELLIS + portrait staging) — the
+            # rigging step below uses `final_path` (the retex GLB) as input,
+            # so we keep that file in place.
             for p in (trellis_path, portrait_staged):
                 try:
                     p.unlink()
                 except OSError:
                     pass
 
-            task_record["status"] = "complete"
-            task_record["glb_path"] = str(final_path)
-            task_record["glb_size_bytes"] = clean_size
+            # ── Phase 5: Meshy Rigging ──────────────────────────────────
+            # The retex GLB is now at final_path = AVATARS_DIR / {task_id}.glb.
+            # That URL is what Quest will fetch during Stage 2 scan reveal
+            # (status="rigging" tells the UI to fire Stage 2 — the retex
+            # avatar IS the Stage 2 form). We submit Meshy Rigging using the
+            # retex URL as model_url, get back a rigged GLB, then graft the
+            # premium PBR materials back onto the rigged mesh, and OVERWRITE
+            # final_path with the final rigged+grafted result. By the time we
+            # set status="complete", final_path contains the rigged form
+            # that Stage 3 will fetch.
+            #
+            # NO animation step — we skip /animations entirely. Unity-side
+            # breath driver (RiggedAvatarBreath) handles aliveness procedurally
+            # via Spine02 oscillation on the rigged skeleton.
+            task_record["status"] = "rigging"
+            try:
+                retex_public_url = f"{base}/avatars/{final_path.name}"
+
+                t8 = time.perf_counter()
+                rig_task_id = await submit_rigging(
+                    model_url=retex_public_url,
+                    height_meters=1.7,
+                )
+                task_record["meshy_rigging_id"] = rig_task_id
+                log.info(
+                    "[task %s] meshy rigging submitted id=%s elapsed=%.2fs",
+                    task_id, rig_task_id, time.perf_counter() - t8,
+                )
+
+                t9 = time.perf_counter()
+                rig_task = await poll_rigging_until_complete(rig_task_id)
+                log.info(
+                    "[task %s] meshy rigging completed elapsed=%.2fs",
+                    task_id, time.perf_counter() - t9,
+                )
+
+                rigged_remote_url = extract_rigged_glb_url(rig_task)
+                rigged_raw_path = AVATARS_DIR / f"{task_id}_rigged_raw.glb"
+
+                t10 = time.perf_counter()
+                async with httpx.AsyncClient(timeout=180.0) as c:
+                    r = await c.get(rigged_remote_url, follow_redirects=True)
+                if r.status_code != 200:
+                    raise MeshyDownloadError(
+                        f"rigged GLB download HTTP {r.status_code} from {rigged_remote_url}"
+                    )
+                if r.content[:4] != b"glTF":
+                    raise MeshyDownloadError(
+                        f"rigged GLB not a glTF — magic={r.content[:4]!r}"
+                    )
+                rigged_raw_path.write_bytes(r.content)
+                rigged_raw_size = rigged_raw_path.stat().st_size
+                log.info(
+                    "[task %s] rigged glb downloaded -> %s (%d bytes, %.2fs)",
+                    task_id, rigged_raw_path.name, rigged_raw_size,
+                    time.perf_counter() - t10,
+                )
+
+                # Graft PBR from the retex (final_path) onto rigged_raw_path,
+                # write the result to a temp path. Then atomically move it
+                # over final_path so Quest's next fetch returns the rigged
+                # version. Graft runs CPU-bound (.glb parse + buffer copy);
+                # use to_thread to avoid blocking the event loop.
+                grafted_temp_path = AVATARS_DIR / f"{task_id}_grafted_temp.glb"
+                t11 = time.perf_counter()
+                graft_fn = _graft_pbr()
+                graft_summary = await asyncio.to_thread(
+                    graft_fn, final_path, rigged_raw_path, grafted_temp_path,
+                )
+                log.info(
+                    "[task %s] graft pbr complete -> %s (%d bytes, %.2fs)",
+                    task_id, grafted_temp_path.name,
+                    graft_summary.get("out_size", 0), time.perf_counter() - t11,
+                )
+
+                # Atomic overwrite: final_path goes from retex → rigged+grafted.
+                shutil.move(str(grafted_temp_path), str(final_path))
+                final_size = final_path.stat().st_size
+
+                # Cleanup
+                try:
+                    rigged_raw_path.unlink()
+                except OSError:
+                    pass
+
+                task_record["status"] = "complete"
+                task_record["glb_path"] = str(final_path)
+                task_record["glb_size_bytes"] = final_size
+                log.info(
+                    "[task %s] PIPELINE COMPLETE — final rigged+grafted glb at %s (%d bytes)",
+                    task_id, final_path.name, final_size,
+                )
+
+            except (MeshyJobError, MeshyDownloadError, TimeoutError, httpx.HTTPError) as e:
+                # Rigging failed (Meshy error, our timeout, or any httpx-level
+                # network issue including httpcore.ReadTimeout). Fall back to
+                # serving the retex GLB as final. Quest's Stage 3 will fetch
+                # the same {task_id}.glb URL and get the retex (no skeleton).
+                # RiggedAvatarBreath will fail to resolve Spine02 → no breath,
+                # but the rest of Stage 3 still fires. Better than failed.
+                log.warning(
+                    "[task %s] meshy rigging failed (%s: %s) — serving retex as final",
+                    task_id, type(e).__name__, e,
+                )
+                task_record["status"] = "complete"
+                task_record["glb_path"] = str(final_path)
+                task_record["glb_size_bytes"] = clean_size
+                task_record["rigging_error"] = f"{type(e).__name__}: {e}"
 
         except (MeshyJobError, MeshyDownloadError, TimeoutError) as e:
             log.warning(

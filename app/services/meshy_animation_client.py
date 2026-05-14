@@ -98,7 +98,11 @@ def extract_animation_glb_url(task: dict[str, Any]) -> str:
 
 async def _post_task(path: str, body: dict[str, Any], label: str) -> str:
     url = f"{settings.meshy_base_url}{path}"
-    async with httpx.AsyncClient(timeout=60.0, headers=_headers()) as c:
+    # 300s timeout — Meshy /rigging endpoint can be slow on the initial POST
+    # because Meshy fetches the input model_url upfront before accepting the
+    # task. If our ngrok tunnel is rate-limited, this fetch can take 60-120s.
+    # 300s leaves headroom.
+    async with httpx.AsyncClient(timeout=300.0, headers=_headers()) as c:
         r = await c.post(url, json=body)
     if r.status_code >= 400:
         raise MeshyJobError(f"meshy {label} submit HTTP {r.status_code}: {r.text}")
