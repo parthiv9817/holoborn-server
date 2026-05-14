@@ -1,194 +1,153 @@
-# HoloBorn Spawn Ritual & World-Anchored Progress — Design Spec v2
+# HoloBorn Spawn Ritual & World-Anchored Progress — Design Spec v3
 
 **Author:** Parthiv (with Claude Code)
-**Date:** 2026-05-08
-**Status:** v2 — cross-AI feedback (ChatGPT + Gemini) integrated. Locked for implementation.
-**Target ship:** Today (2026-05-08) + Saturday (2026-05-09). Sunday is demo capture day.
+**Date:** 2026-05-08 (v3 amended end-of-day)
+**Status:** v3 — simplified architecture per Parthiv's end-of-day refinement. Locked for Saturday implementation.
+**Target ship:** Saturday 2026-05-09 + Sunday 2026-05-10 (demo capture).
 
 ---
 
-## v2 changes from v1 (cross-AI review integrated)
+## v3 changes from v2 (Parthiv's end-of-day simplification)
 
-| v1 → v2 change | Why |
+| v2 → v3 change | Why |
 |---|---|
-| **6 phases → 5 phases** (P4 rigging + P5 animating merged into "Internal activation") | Both AIs flagged P4-P5 as the weakest beats; merging gives one clear semantic phase instead of two ambiguous ones |
-| **Eye-glow at spawn → killed, replaced with first-breath + gaze acquisition** | Both AIs called eye-glow a 80s-robot trope. Breath + gaze sells "presence" without cheese |
-| **"Cubes rain from above" → "Cubes emerge upward from floor circle"** | ChatGPT: vertical column at spawn site = stronger spatial anchor, anime-summoning vocabulary. User agreed. |
-| **Continuous thrum (5 min loop) → sparse event-driven audio + fade-to-near-silence** | Both AIs: continuous loop at this duration becomes tinnitus. Heartbeat pattern instead. |
-| **Cyan dominant → white-dominant with cyan accent (90% white / 10% cyan)** | Gemini: pure cyan = "default URP emissive" / "generic sci-fi." 90/10 ratio is what makes Vision Pro feel expensive. ChatGPT pushed for purple/amber but cyan still maps best to scan/reconstruct metaphor. |
-| **Bone-glyphs in P4 → killed, replaced with energy-pathway lines (joint-to-joint traces)** | ChatGPT: literal bone graphics inside cube cloud cause URP alpha depth-sort issues. Gemini: "internal lines ignite, NOT literal bones." Both right. |
-| **300 individual GameObject cubes with per-cube `Update()` → single `CubeCloudManager` with flat Transform array, one centralized `Update()` loop** | ChatGPT: 300 individual `Update()` callbacks tank Quest 3 CPU; centralized manager keeps perf above 72 fps |
-| **Vert sampling: ambiguous → explicit: sample on Quest from generic placeholder mesh during P3-P4, resample from actual GLB at P5** | ChatGPT's architectural question forced this resolution. Real GLB doesn't exist during P3-P4, so we use a static placeholder (`Assets/HoloBorn/Models/silhouette_placeholder.fbx`, ~5-10K tris, T-pose). |
-| **P1 user-side particle burst → killed, replaced with single bright "lock" flash + haptic + camera-shutter audio** | ChatGPT: particles from user is noise that fights the cube show. The cubes are the show. |
-| **Drop shadow added as explicit grounding requirement** | ChatGPT: avatar without contact shadow = "2D sticker floating in passthrough." Already on Tier 1 plan as #4 (blob shadow), now confirmed as load-bearing. |
+| **5 phases collapsed to 4** | Phase 4 "internal activation" (cube cloud holds + energy pathways during Meshy rigging) was the weakest beat, both AIs flagged it as soft. Removed entirely. |
+| **Snap-to-mesh shader DELETED** | The 2.5-second cube-flow-onto-mesh-vertex climax replaced with simpler "cubes coordinated dissolve + static GLB materializes underneath" transition. Saves ~3 hours of Shader Graph + visual-debug work. Eliminates the highest-risk visual phase. |
+| **Re-sample cubes from real GLB at climax DELETED** | No longer needed — cubes don't snap to the real mesh, they vanish before the mesh appears. Saves orchestrator complexity. |
+| **Phase 5 "Spawn climax" → Phase 4 "Animation kickoff"** | When Meshy returns the rigged GLB, the static mesh is *replaced* by the rigged version, idle clip starts, subtle breath + gaze acquisition. Crisper transition than v2's snap-fade-dissolve sequence. |
+| **NEW: cyan grounding glow during rigging period** | Subtle floor-circle pulse under the static avatar while Meshy works (~30-60s). Signals "system is still working" without requiring complex visuals. Doubles as the blob-shadow grounding the locked plan already had. |
+| **Backend exposes 2 GLB URLs at different phases** | `/avatars/{id}_static.glb` available when status = `rigging` (TRELLIS output, no rig); `/avatars/{id}.glb` available when status = `complete` (Meshy rigged + animated). Quest fetches whichever is current. ~30 min server-side change. |
+
+**Why Parthiv proposed this and why it's actually better:**
+
+The v2 design was technically correct but had two soft beats (Phase 4 internal activation, Phase 5 cube-snap climax) where neither ChatGPT nor Gemini had a strong recommendation for what to do. Both AIs' feedback essentially admitted "this part is weak but try this anyway." Parthiv's instinct: when a design has weak beats, the answer is usually to remove them, not polish them.
+
+The v3 simplification trades the "matter snaps onto avatar shape" climax for "cubes vanish + finished avatar appears" — slightly less integrated cinematically, but: (1) cleaner narrative beats (3 visible moments instead of 5), (2) ships faster (eliminates ~3hr of Phase H shader work), (3) lower risk (the snap-to-mesh shader was the highest-likelihood visual failure mode), (4) easier to debug at Quest test time.
+
+This applies the lesson from `mistakes/2026-05-08.md` — when a design has a "Phase X is the weakest beat" comment in it, that's signal that Phase X shouldn't exist, not that it needs more polish.
 
 ---
 
 ## TL;DR
 
-The HoloBorn backend takes 7-10 minutes to produce a rigged avatar (portraitizer + RunPod TRELLIS + Meshy). A 2D progress bar fails in VR because the user has the entire room available and would stare at static glass for that whole duration.
+The HoloBorn backend takes 7-10 minutes to produce a rigged, animated avatar. A 2D progress bar fails in VR for two reasons: the user has the entire room available, and they will literally stand and stare for that whole duration.
 
-**Solution:** a continuous cube-cloud assembly visible at the eventual spawn location, growing and changing across all backend phases via 5 distinct beats, climaxing in a 2.5-second snap-to-mesh ritual when the rigged GLB arrives. The waiting time becomes emotional theater, not dead latency.
+**Solution:** a cube-cloud that assembles a humanoid silhouette in the spawn location during the long-duration phases (portraitizer + TRELLIS, ~4-6 min), then dissolves to reveal the static avatar mesh when TRELLIS completes. The static avatar stands with a subtle cyan grounding glow while Meshy rigs (~30-60s). When rigging completes, the static mesh is replaced by the rigged+animated GLB and the avatar comes to life with a subtle breath + gaze acquisition + idle clip.
 
-This single feature absorbs four locked Tier 1 items (#3 spawn ritual, #5 spatial audio, #6 haptics, #7 world-anchored progress) into one coherent visual+audio+haptic system.
+The waiting time becomes emotional theater: the user watches the avatar materialize in three crisp visual beats — **assembly → form → life.**
 
-**The strongest psychological design call:** the cube cloud assembles in the EXACT location where the avatar will spawn. The user's brain assigns permanence, anticipation, and spatial ownership to that spot during the wait — that's spatial-native UX that doesn't exist in 2D.
+This single feature absorbs locked Tier 1 items #3 (spawn ritual), #5 (spatial audio), #6 (haptics), #7 (world-anchored progress) into one coherent system.
 
 ---
 
-## Aesthetic references (videos for visual vocabulary)
+## Aesthetic references
 
-Watch these in order — fastest payoff first. The user has limited VR exposure and these establish the visual language.
+Watch in this order (foggy-friendly priority):
 
-1. **Westworld host construction scenes** (HBO S1) — primary reference, "person being built in front of you"
+1. **Westworld host construction scenes** (HBO S1) — primary reference, "person being assembled in real time"
 2. **Avengers: Endgame Iron Man Bleeding Edge nanotech** — particle/cube assembly, snap-to-position discipline
-3. **Apple Vision Pro launch video** (apple.com/vision-pro) — "premium VR" baseline. Note: 90% white, 10% cyan accent.
-4. **Iron Man 2/3 Jarvis hologram lab** — translucent geometric panels, layered depth
-5. **Detroit: Become Human Kamski reveals** — minimal cyan/white, particle-formed
-6. **Ra.One / Transformers Galvatron build** — programmable-matter cube assembly
+3. **Apple Vision Pro launch video** — premium VR baseline, 90% white / 10% cyan accent
+4. **Iron Man 2/3 Jarvis hologram lab** — translucent geometric layered holograms
+5. **Detroit: Become Human Kamski reveals** — minimal cyan/white particle systems
+6. **Ra.One / Transformers Galvatron build** — programmable matter aesthetic
 
-Shared language: **room-anchored**, **depth-layered**, **controlled motion** (NOT chaotic), **monochrome accent at 10%** (the rest is white/neutral), **spatial audio** coming FROM the holograms.
-
-The cubes should move like *a machine with intelligence*, NOT *magic particles*. That distinction determines whether the demo reads as "premium product" or "student VFX reel."
+Shared language: **room-anchored, depth-layered, controlled motion, monochrome accent at 10%, spatial audio coming FROM the holograms.** Cubes move like a machine with intelligence, not magic particles.
 
 ---
 
-## Storyboard — 5 phases, all with active visual content
+## Storyboard — 4 phases (down from 5)
 
 ```
 PHASE 1 — Capture (instant, ~0.3s)
   • Floor circle ignites with bright "lock" flash (1 frame, white)
+  • Camera-shutter audio cue (single shot, spatial)
   • Haptic pulse on left controller
-  • Camera-shutter audio cue (single-shot, spatial)
-  • NO user-side particle burst (the cubes are the show, user is not)
+  • NO user-side particle burst (the cubes are the show)
   • Backend: POST /generate-multiview → returns task_id
 
-PHASE 2 — Energy accumulation (~30-60s, portraitizer)
-  • Cubes start emerging UPWARD from the floor circle into a slow vertical column
-  • ~50-100 cubes, light density, white-with-cyan-accent
-  • Cube arrival rate: 5-10/sec
-  • Soft thrum FADES IN, holds briefly, FADES TO NEAR-SILENCE (no continuous loop)
-  • Floor circle pulses faintly synced to the thrum's fade
-  • Active motion every second — never static
+PHASE 2 — Cube assembly (~4-6 min spans portraitizer + TRELLIS)
+  Sub-phase 2a (during portraitizer, ~30-60s):
+    • Cubes emerge UPWARD from floor circle into a slow vertical column
+    • ~50-100 cubes orbiting slowly, white-with-cyan-accent
+    • Cube arrival rate: 5-10/sec, soft thrum fades in/out
+    • Floor circle pulses faintly, synced to thrum
 
-PHASE 3 — Humanoid reconstruction (~3-5 min, RunPod TRELLIS, the long one)
-  • Vertical column compresses; cubes start finding silhouette positions
-  • Target positions sampled from generic humanoid placeholder mesh
-    (static .fbx, ~5-10K tris, T-pose, ships in Assets/HoloBorn/Models/)
-  • Cube arrival rate increases to 20-30/sec
-  • Cubes "snap and stay" along the silhouette surface
-  • RunPod % directly maps to silhouette completeness:
-      0% = empty silhouette, vortex remnant
-      100% = full humanoid silhouette of ~300 stationary cubes
-  • Color drift within white-cyan palette (ice-cyan accent intensifies as % climbs)
-  • Audio: event-driven subtle "click" on every Nth cube locking, NO continuous loop
-  • Motion progression: chaotic early → organized streams mid → locked silhouette late
-    (This subconsciously communicates "reconstruction convergence" — Gemini's insight)
+  Sub-phase 2b (during TRELLIS, ~3-5 min):
+    • Vertical column compresses; cubes start finding humanoid-silhouette positions
+    • Target positions sampled from generic humanoid placeholder mesh (Y Bot)
+    • Cube arrival rate increases to 20-30/sec
+    • Cubes "snap and stay" along the silhouette surface
+    • RunPod % directly maps to silhouette completeness (0% empty → 100% full)
+    • Color drift cooler as % climbs (white-to-ice-cyan accent intensifies)
+    • Audio: event-driven "click" on every Nth cube locking, NO continuous loop
+    • Motion progression: chaotic early → organized streams mid → locked silhouette late
 
-PHASE 4 — Internal activation (~30-60s, MERGED Meshy rigging + animating)
-  • Silhouette holds steady (humanoid cube shell)
-  • 3-4 energy-pathway lines ignite along joint-to-joint paths INSIDE the cloud:
-      spine, both arms, both legs (additive blend, low alpha to avoid depth-sort issues)
-  • A subtle pulse travels along each pathway (1-2s cycle)
-  • NO literal bone glyphs, NO whole-cloud thinking pulse, NO rehearsal motion
-  • Audio: 1-2 subtle structural "lock" sounds, then silence
-  • Builds anticipation through STILLNESS not motion (premium = restraint)
+PHASE 3 — Static avatar materializes (transition, ~1.5s; then holds during Meshy)
+  Transition (when TRELLIS completes, ~1.5s):
+    • Cubes do a coordinated inward-implosion + dissolve into emissive sparkles → vanish
+    • Static avatar mesh fades in over the same 1.5s window (alpha 0→1)
+    • Spatial whoosh audio + haptic pulse on left controller
+    • Backend exposes /avatars/{id}_static.glb at status = "rigging"
 
-PHASE 5 — Spawn ritual (the 2.5s climax)
-  • Cubes flow inward, snap to actual mesh vertex positions
-    (resampled from the real rigged GLB after glTFast InstantiateMainSceneAsync)
-  • PBR avatar mesh fades in underneath as cubes land (alpha 0→1 over 1.5s)
-  • Settled cubes dissolve into emissive sparkles → vanish
-  • Avatar takes a SUBTLE FIRST BREATH (chest expand, shoulders settle, ~0.4s)
-  • Avatar's gaze acquires the user (head turns slightly toward user position)
+  Hold (during Meshy rigging+animating, ~30-60s):
+    • Static avatar stands motionless at spawn location
+    • Subtle cyan grounding glow under feet (slow pulse, ~2s cycle)
+    • Faint emissive cyan tint on avatar surface (very subtle, signals "still processing")
+    • Audio: silent or very low ambient texture
+    • Visual story: "the form exists, now waking up"
+
+PHASE 4 — Animation kickoff (when Meshy completes, ~1s climax)
+  • Static avatar replaced by the rigged+animated GLB (Quest fetches /avatars/{id}.glb)
+  • Cyan grounding glow fades to zero over 0.5s
+  • Avatar's surface emissive tint fades to zero (the "wake up" cue)
+  • Subtle breath animation as first idle keyframe (chest expand, shoulders settle)
+  • Head turns slightly toward user (gaze acquisition, 0.5s eased rotation)
   • Idle animation begins (Meshy's baked Idle clip, AnimationMethod.Legacy)
-  • NO eye-glow (killed — too "robot awakening")
-  • Audio: spatial whoosh during cube flow → soft chime at breath → quiet
+  • Audio: soft chime at the breath moment, ambient idle layer fades in
   • Haptic pulse on left controller at the breath moment
+  • NO eye-glow (killed in v2, stays killed)
 ```
 
----
-
-## Implementation order (foundations first, ~11hrs)
-
-### Step 1 — `CubeCloudManager` + cube prefab (~2hr)
-
-- Low-poly cube prefab (12 tris, single-color white-with-emission cyan accent material, unlit)
-- `CubeCloudManager.cs` — owns a flat array of N=300 Transform references. Pool-based: `Spawn(origin) → Cube`, `Despawn(cube)`. Manages ALL per-frame motion in a single `Update()` loop iterating the array. **No per-cube `MonoBehaviour.Update()`** — critical perf rule.
-- Pool size: 400 (300 active peak + 100 buffer)
-- **Done when:** spawn 300 cubes in Editor, verify Profiler stays >72 fps at all times, verify zero per-cube Update callbacks via Profiler.
-
-### Step 2 — Cube target-position lerp (~1hr)
-
-- Each Cube has `targetPosition` + `lerpDuration` + `startTime` fields. Manager iterates and lerps each frame with ease-out curve.
-- `cube.SetTarget(Vector3 worldPos, float duration)` — public API.
-- **Done when:** spawn 100 cubes at random positions, call `SetTarget(humanoidVert, 2f)` on each; cubes converge to silhouette in 2s with smooth easing.
-
-### Step 3 — Vortex behavior (~30min)
-
-- `VortexBehavior` component on the Manager. Given center+axis+radius+height, computes orbit position around vertical axis above floor circle for any cube assigned to vortex group.
-- For Phase 2: cubes orbit slowly (1 revolution / 4s), light vertical drift to simulate energy column rising.
-- **Done when:** 50 cubes in vortex behavior, smooth orbit, no jitter or popping.
-
-### Step 4 — Silhouette behavior with placeholder mesh (~2hr)
-
-- Static asset: `Assets/HoloBorn/Models/silhouette_placeholder.fbx` — ~5-10K tris humanoid, T-pose. Source: Mixamo free download or Marvelous Designer template (~30min one-time prep).
-- `SilhouetteBehavior` component — given target mesh + coverage % (0-1), assigns each cube a target vertex sampled from the mesh. Coverage = fraction of cubes that have a silhouette target (rest stay in vortex).
-- **Done when:** load placeholder mesh, call `SetCoverage(0.5)`, verify 50% of cubes are at silhouette positions and 50% remain in vortex.
-
-### Step 5 — Snap-to-mesh shader + dissolve (~3hr)
-
-- Vertex displacement shader on the cube material. A cube's quad verts lerp from "cloud position" to "real mesh vert position" over 2.5s.
-- After snap: alpha fade 1→0 over 1s with emissive boost (sparkle effect).
-- **Critical:** at P5 entry, real GLB has been instantiated by glTFast — manager resamples target positions from `SkinnedMeshRenderer.sharedMesh.vertices` of the real avatar (not the placeholder).
-- **Done when:** 300 cubes positioned along placeholder silhouette, real GLB instantiated, trigger snap, all cubes converge to real mesh verts in 2.5s and dissolve cleanly with no visible pop.
-
-### Step 6 — Phase orchestrator state machine (~1.5hr)
-
-- `SpawnRitualController.cs` — listens to backend status (existing `/generate/{task_id}/status` poll), drives 5 phase transitions.
-- States: `IDLE → P1 → P2 → P3 → P4 → P5 → IDLE_AVATAR`
-- **Backend status mapping:** `portraitizing` → P2, `generating` (with `progress` 0-100) → P3, `rigging` OR `animating` → P4, `complete` → P5
-- **Backend change required (~30min):** `app/routes/generation.py` schema needs to expose `portraitizing | generating | rigging | animating | complete` status values instead of current `processing | complete | failed`. Backwards-compat shim acceptable.
-- **Done when:** simulate fake status updates in sequence, verify all 5 phases visually transition correctly in Editor.
-
-### Step 7 — Audio + haptics layer (~1hr)
-
-- `SpawnRitualAudio.cs` — Unity AudioSource at world-point above floor circle, `spatialBlend = 1.0`
-  - **P1:** single camera-shutter shot + haptic pulse on left controller (capture lock)
-  - **P2:** thrum fades in over 5s, holds 5s, fades to near-silence over 5s — does NOT loop
-  - **P3:** event-driven subtle "click" on every Nth cube locking position (N tuned so total click count over phase = ~30-50)
-  - **P4:** 1-2 subtle structural "lock" sounds, then silence
-  - **P5:** spatial whoosh during cube flow (1.5s) → soft chime at breath moment → ambient idle layer fades in
-- Haptics: `OVRInput.SetControllerVibration(amplitude, frequency, controller)` on capture lock (P1) + breath moment (P5)
-
-### Step 8 — Polish pass (~1.5hr)
-
-- Color drift: white-dominant cube material with cyan emissive accent that intensifies through P3 (subtle, never overwhelming — we're targeting Apple Vision Pro restraint, not cyberpunk maximalism)
-- Energy-pathway lines (Phase 4): 3-4 LineRenderer strokes between joint positions on the placeholder mesh, additive shader, low alpha. Pulse animation on `_BaseColor` over 1-2s cycle.
-- Breath + gaze acquisition (Phase 5):
-  - Breath: small `Animator` blend on the spawned avatar's chest+shoulder bones (procedural, ~0.4s, ease-out)
-  - Gaze: `head.LookAt(camera.position)` with 0.5s eased rotation, then settle into idle
-- Cube dissolve sparkle particle (Phase 5): Unity built-in particle burst on cube despawn, ~5 particles per cube, 0.3s lifetime, additive
-
-**Total: ~12 hours.**
-- Today (~5hr remaining after this planning): Steps 1-3 + start of Step 4
-- Saturday (~7hr): Steps 4-8
+The 4 narrative beats:
+1. **"The work happens HERE"** (Phase 1 — floor circle ignites)
+2. **"Matter assembles into shape"** (Phase 2 — cubes form humanoid silhouette)
+3. **"Form materializes"** (Phase 3 transition — cubes vanish, avatar appears)
+4. **"Life begins"** (Phase 4 — breath, gaze, idle starts)
 
 ---
 
-## Generic humanoid placeholder mesh
+## Implementation order — Saturday plan (~5-6 hours, was ~12 hours in v2)
 
-Static asset shipping with the Unity app. Used as silhouette target during P3-P4 before real GLB exists.
+| Step | What it builds | Estimated |
+|---|---|---|
+| 1 — Backend GLB-URL split | `app/services/generation_pipeline.py`: save TRELLIS output to `_static.glb`, save Meshy output to plain `.glb`. `app/routes/generation.py`: status endpoint returns `_static.glb` URL during `rigging`/`animating`, returns plain `.glb` URL at `complete`. ~30 min server-side change. | 30 min |
+| 2 — Phase orchestrator scene wiring | SpawnRitualController + state machine + per-phase entry behaviors (P1 capture / P2 cube assembly / P3 static-mesh transition / P4 animation kickoff). Listens to `/generate/{task_id}/status`, drives transitions. | 1.5 hr |
+| 3 — Cube dissolve transition (Phase 3 entry) | When backend status flips to `rigging`, cubes get a coordinated implosion target + alpha fade + emissive sparkle on despawn. ~30 lines + particle effect. NO snap shader needed. | 45 min |
+| 4 — Static avatar with cyan glow during rigging | Add a small Quad floor-circle child to the static avatar prefab + emissive shader with animated alpha. Plus material-level emissive tint controller on the avatar's renderers. | 45 min |
+| 5 — Static→rigged GLB swap (Phase 4 entry) | When status = `complete`, fetch new GLB, replace static one in scene, fade out the grounding glow + emissive tint. | 30 min |
+| 6 — Breath + gaze on idle start | Procedural head-look-at-user (0.5s eased) + emit-first-idle-keyframe trigger. Added to the same component that handles Phase 4 entry. | 45 min |
+| 7 — Audio + haptics (sparse, event-driven) | SpawnRitualAudio.cs hooked to phase transitions. P1 lock + shutter, P2 cube clicks (event-driven), P3 whoosh + haptic, P4 breath chime + haptic. | 1 hr |
+| 8 — Quest sideload + integration test | Build APK, sideload, capture-to-spawn end-to-end run. First time the full ritual runs on device. Profiler check: stays >72 fps. | 1 hr |
 
-- **Path:** `Assets/HoloBorn/Models/silhouette_placeholder.fbx`
-- **Topology:** ~5-10K tris, single mesh, no materials, no animations
-- **Pose:** T-pose
-- **Source options:**
-  - Mixamo (free) — download any base mesh, retopologize if >10K
-  - Adobe Marvelous Designer — humanoid base
-  - Sketchfab CC0 — humanoid base
-- **Prep time:** ~30 min one-time
-- **Why static:** real GLB doesn't exist during P3-P4 phases; we need a stable target geometry for cubes to converge on. Placeholder is invisible to the user (it's not rendered), only its vertices are sampled as cube targets.
+**Total: ~6 hours.** Was ~12 hours in v2. Eliminated: snap-to-mesh shader (Phase H), Phase 4 internal activation visuals, energy-pathway lines, cube-resampling-from-real-GLB at climax.
+
+**Sunday:** demo MP4 capture. No new code.
+
+---
+
+## What carries over from v2 (still applies in v3)
+
+These were locked in v2 and remain unchanged:
+
+- **`Cube.cs` POCO with EaseOutCubic + SetTarget + Tick** (already shipped, 5 tests green)
+- **`CubeCloudManager.cs` pool with single Update loop** (already shipped, 6 tests green)
+- **`VortexBehavior.cs` orbit math** (already shipped, 7 tests green)
+- **`SilhouetteBehavior.cs` Fisher-Yates vertex sampling** (already shipped, 6 tests green)
+- **Generic humanoid placeholder mesh** (`Assets/HoloBorn/Models/silhouette_placeholder.fbx`, Mixamo Y Bot, ~6.7K verts) — vertex-source for Phase 2b silhouette positions only. Still NEVER rendered to screen.
+- **300 cubes default** (tunable via `poolSize` field, Parthiv flagged this likely needs UP-bump to 1000-2000 once we see Phase 2b density on Quest)
+- **CubeCloudManager's no-per-cube-Update perf rule** (validated Friday on Quest, 60 FPS sustained)
+- **Color discipline:** 90% white / 10% cyan accent (Vision Pro restraint, not cyberpunk)
+- **Audio sparse + event-driven** (no continuous 5-min loops)
 
 ---
 
@@ -196,114 +155,95 @@ Static asset shipping with the Unity app. Used as silhouette target during P3-P4
 
 | Element | Count | Tris | Notes |
 |---|---|---|---|
-| Cubes (peak, P3-P5) | 300 | 12 each = 3,600 total | Low-poly, single material, GameObject-pooled but driven by single manager Update |
-| Avatar mesh (final, P5+) | 1 | ~30,000 (Meshy decimation) | Validated 2026-05-07 |
-| Placeholder mesh (P3-P4 internal) | 1 | ~5-10K (sampling target only) | Never rendered |
-| Floor circle | 1 | ~32 | Quad with circular alpha cutoff |
-| Energy-pathway lines (P4) | 3-4 | ~10 each | LineRenderer, additive blend |
+| Cubes (peak Phase 2) | 300-1000 (tune up if sparse) | 12 each | Validated at 300 = 60 FPS in Editor; bump to 1000 likely fine on Quest 3 |
+| Avatar mesh (Phase 3+) | 1 | ~30K (Meshy decimation) | Validated 2026-05-07 |
+| Floor circle / grounding glow | 1 | ~32 | Quad with circular alpha cutoff + animated emission |
+| Particle dissolve burst (Phase 3 entry) | ~5 per cube × N cubes | n/a | GPU-driven Unity built-in particles, short lifetime |
 
-**Frame target:** stays >72 fps in Quest Profiler during all 5 phases. Hard floor: never below 60 fps even at P5 climax (300 cubes flowing + mesh fading in + sparkles + breath/gaze + audio + haptics simultaneously).
-
-**Architectural rule (from ChatGPT review):** all cube motion goes through `CubeCloudManager.Update()`'s single iteration. ZERO per-cube `MonoBehaviour.Update()` callbacks. Per-cube callbacks at 300×72fps = 21,600 callbacks/sec — measurably murders Quest 3 CPU.
+**Frame target:** stays >72 FPS during all phases. Hard floor: never below 60 FPS even at Phase 2b peak (300+ cubes animating + URP + passthrough).
 
 **Fallback ladder if perf is tight:**
-1. Drop cube count: 300 → 200 → 150 → 100. Below 100, the cube aesthetic is lost.
-2. Drop energy-pathway lines (Phase 4 still has audio + stillness)
-3. Drop color drift, lock to single white-cyan material
-4. **Last resort:** switch to `Graphics.DrawMeshInstanced` (GPU-batched, no GameObjects). Loses per-cube target-position control unless we ship a custom compute shader. ~2hr extra work if needed.
+1. Reduce cube count: 1000 → 500 → 300 → 200
+2. Drop the cube-locking click events (audio-only, no haptics)
+3. Drop the cyan emissive tint on static avatar during rigging (just floor glow)
 
 ---
 
 ## Acceptance criteria (objective, not subjective)
 
-To prevent the 2026-05-07 mistake #1 pattern (Claude misreading Quest screenshots and calling things "great" when they had visible artifacts), each phase has objective pass criteria. **Measured, not judged from a screenshot.**
-
 | Phase | Pass criteria |
 |---|---|
-| P1 | Floor circle bright-flash for ≤1 frame; haptic fired (verified via OVRInput debug log); shutter audio fired (verified via AudioSource.isPlaying log) |
-| P2 | Cube count grows 0 → 50-100 over 30s (verifiable via manager pool count); thrum fades in, holds, fades to near-silence (verified via Audio Mixer dB tracking); Profiler shows steady >72 fps |
-| P3 | At backend `progress=50%`, exactly 50% of cubes are in silhouette positions (instrumented log); at 100%, all cubes stationary on silhouette; FPS holds; "click" events fired ~30-50 total (verified via log) |
-| P4 | Silhouette cube count holds steady ±2 (no drift); energy-pathway lines render with positive alpha (≥0.05); 1-2 lock sounds fired; rest of phase has zero scheduled audio events |
-| P5 | All 300 cubes converge to real mesh vert positions in 2.5s ±0.1s (instrumented timing); mesh alpha 0→1 over 1.5s; cubes alpha 1→0; breath bone motion plays for ≥0.3s; gaze rotation acquires camera target within ±5° in 0.5s; total spawn frame budget <40ms |
+| P1 | Floor circle bright-flash for ≤1 frame; haptic fired (verified via OVRInput log); shutter audio fired (verified via AudioSource log) |
+| P2a | Cube count grows 0 → 50-100 over 30s; thrum fades in/out cleanly (audio mixer dB tracking); Profiler steady >72 FPS |
+| P2b | At backend `progress=50%`, exactly 50% of cubes are in silhouette positions (instrumented log); at 100%, all cubes stationary on silhouette; "click" events fired ~30-50 total (verified via log) |
+| P3 transition | Cubes converge inward + dissolve over 1.5s ±0.1s (instrumented timing); static avatar alpha goes 0→1 in same window; whoosh audio + haptic fire at transition start |
+| P3 hold | Cyan grounding glow visible + pulsing; cube count = 0 (despawn complete); avatar stands motionless |
+| P4 | Static GLB swap to rigged GLB happens cleanly (Quest fetches new URL within 1s); cyan glow fades to 0; breath animation plays for ≥0.3s; gaze rotation acquires camera target ±5° in 0.5s; idle clip starts |
 
 **Subjective visual reads (Claude's job NOT to assert):**
 - "Does it FEEL premium?" — user-only call
-- "Does the color look right?" — user-only call
-- "Is the timing right?" — user-only call
-
-When user reports something looks off, defer to their empirical observation. Claude's value is narrowing the bug-search-space via logs/code/architecture, not subjective screenshot interpretation.
+- "Does the timing feel right?" — user-only call
+- "Are 300 cubes enough?" — user-only call (decided empirically when Phase 2b fires for the first time)
 
 ---
 
-## Out of scope for this design
+## Out of scope for v3 (explicit)
 
-Explicitly NOT in this spec:
-
-- **Glassmorphism HUD background** — dropped 2026-05-06, stays dropped
-- **Font swap / typography hierarchy** — dropped 2026-05-06, stays dropped
-- **Animated text fade transitions** — dropped, replaced by world-anchored cube cloud
-- **Hand-tracking pinch interactions** — v2 post-demo
-- **Custom skin SSS shader / hair-card LOD shader** — v2 post-demo
-- **Reflection probe baked at scene origin** — Tier 2 in 2026-05-06 brief, ship if time after Tier 1
-- **Multi-seed TRELLIS lottery** — server-side, separate brick
+- Snap-to-mesh vertex displacement shader (DELETED in v3)
+- Phase 4 internal activation / energy-pathway lines (DELETED in v3 — Phase 4 collapsed)
+- Cube re-sampling from real GLB mesh (no longer needed — cubes vanish before real mesh appears)
+- Glassmorphism HUD background (dropped in v2, stays dropped)
+- Font swap / typography hierarchy (dropped in v2, stays dropped)
+- Hand-tracking pinch interactions (post-demo)
+- Custom skin SSS shader / hair-card LOD shader (post-demo)
+- Reflection probe baked at scene origin (post-demo or Sunday-AM polish if time)
+- Multi-seed TRELLIS lottery (server-side, separate brick)
 
 ---
 
-## EOW timeline slot
+## Backend changes required (Saturday morning, ~30 min)
+
+1. **`app/services/generation_pipeline.py`** — after RunPod completes and downloads GLB to local, save it as `{AVATARS_DIR}/{task_id}_static.glb`. Then send to Meshy. When Meshy completes, save final rigged GLB as `{AVATARS_DIR}/{task_id}.glb`.
+
+2. **`app/routes/generation.py` `task_status` endpoint** — return different `glb_url` based on status:
+   ```
+   if status == "rigging" or status == "animating":
+       glb_url = f"/avatars/{task_id}_static.glb"
+   elif status == "complete":
+       glb_url = f"/avatars/{task_id}.glb"
+   else:
+       glb_url = ""  # not yet available
+   ```
+
+3. **No Quest-side GLB-handling change required** — TestGlbLoader already fetches whatever URL is current. The orchestrator will trigger TestGlbLoader twice (once at P3 transition with static URL, once at P4 with rigged URL) and let the second load replace the first.
+
+---
+
+## EOW timeline
 
 | Day | Block | Deliverables |
 |---|---|---|
-| Fri 2026-05-08 (today, ~5hr remaining after planning) | Foundations | Steps 1-3 (CubeCloudManager + lerp + vortex) + start of Step 4 |
-| Sat 2026-05-09 (full day) | Climax + polish | Steps 4-8 (silhouette + snap shader + orchestrator + audio/haptics + polish) |
-| Sun 2026-05-10 | Demo capture | MP4 record |
+| **Saturday 2026-05-09** (full day, ~6 hr work) | All implementation | Backend GLB split + orchestrator wiring + cube dissolve + static-avatar-with-glow + GLB swap + breath/gaze + audio + Quest integration |
+| **Sunday 2026-05-10** | Demo capture | MP4 record, retake until clean, founder send |
 
-**Priority interrupt rule:** Vipin lands paid Meshy creds → drop everything, run `tests/scripts/test_meshy_manual.py` against real key, validate end-to-end Meshy integration. Resume spawn ritual work afterward.
-
-**Cuts if time runs out (in order of cut priority):**
-1. Drop Step 8 polish entirely (no color drift, no energy-pathway lines, no breath, no gaze). Static white cubes + snap-to-mesh + idle animation. Demo with Steps 1-7 — still meaningfully premium vs current pop-in.
-2. Reduce cube count 300 → 150. Visual is less dense but still reads as assembly.
-3. Drop energy-pathway lines, keep Phase 4 silent + still (anticipation through pure stillness).
+**Cuts ladder if Saturday slips:**
+1. Drop breath + gaze (just trigger idle clip directly — still feels alive)
+2. Drop cyan grounding glow during rigging (just static avatar standing — slightly less premium but works)
+3. Drop the cube dissolve sparkle particles (cubes just deactivate cleanly — works but less refined)
+4. Reduce cube count to 200 if Phase 2b feels visually-fine at lower density
 
 ---
 
-## How this slots into the existing Unity codebase
+## Cross-AI review feedback resolution (preserved from v2)
 
-- **TestGlbLoader.cs** — currently spawns rigged GLB instantly. Becomes the consumer of `SpawnRitualController.OnSpawnComplete(GameObject avatar)`. The Loader stays responsible for download + glTFast instantiate; the Controller runs the ritual.
-- **ScanController.cs** — existing A/X handler. Triggers `SpawnRitualController.BeginRitual(spawnLocation)` on capture (P1).
-- **`/generate/{task_id}/status` poll** — existing client poll, but the Controller reads from it. Backend change: status field needs new values (`portraitizing | generating | rigging | animating | complete`). ~30min server-side change in `app/routes/generation.py` + matching schema in `app/models/generation_schemas.py`.
-- **HUD canvas** — stays for status text + debug only. Stops being the primary visual; cube cloud is.
-- **New Unity assets:**
-  - `Assets/HoloBorn/Models/silhouette_placeholder.fbx`
-  - `Assets/HoloBorn/Materials/Cube_WhiteCyan.mat` (URP/Lit, white base + cyan emission)
-  - `Assets/HoloBorn/Shaders/CubeSnapDissolve.shadergraph`
-  - `Assets/HoloBorn/Prefabs/CubePrimitive.prefab`
-  - `Assets/HoloBorn/Audio/spawn_ritual/*.wav` (lock_flash, thrum_loop_short, click_lock, structural_lock, whoosh, breath_chime)
+Both ChatGPT and Gemini reviewed v1. Convergent points became locked changes (in v2). Their divergent point (cyan vs purple/amber) was resolved in favor of cyan with the 90/10 white-accent ratio.
 
----
+The v3 simplification did NOT go back to the AIs for re-review — Parthiv's call. Reasoning: the simplification is in the direction the AIs already pushed (drop the weak Phase 4, simplify the climax). It's a defensible refinement of their feedback, not a contradiction of it.
 
-## Implementation principle
-
-**Build bottom-up, test in Editor as much as possible.** Steps 1-4 can be developed entirely in Unity Editor with placeholder mesh — no Quest cycle needed. Step 5 onwards requires Quest tests. Each Quest test cycle is ~5-10min on Intel Mac, so minimize them: validate per-step behavior in Editor first.
-
-The user has weak VR visualization (their words). Building incrementally lets them watch each layer come alive in Editor and provide feedback as the system grows. The opposite (top-down "wire all 8 steps then test") would land us at hour 11 with a broken integration and no idea what failed.
-
----
-
-## Cross-AI review feedback resolution
-
-Both ChatGPT and Gemini reviewed v1 of this spec. Their convergent points became locked changes (above). Their divergent point (cyan vs purple/amber) was resolved in favor of cyan with the 90/10 white-accent ratio, because:
-
-- HoloBorn's core fantasy is **scan + reconstruct**, not magic or luxury
-- Cyan is the universal scan-language across Westworld, Vision Pro, Apple LiDAR
-- ChatGPT's "default URP emissive" critique is real but the fix is execution discipline (90/10 ratio, single accent), not switching color
-- A purple/amber A/B test can happen in v3 polish if Saturday afternoon allows
-
-**Tracked alternatives if Saturday late polish allows:**
-- Test amber accent variant on the same cube material (~30min A/B)
-- Try cubes-emerge-from-floor vs cubes-form-mid-air-around-circle as alternate motion start
+If Saturday morning we want to validate v3 once more, ~5 minutes to paste the v3 changes into ChatGPT/Gemini for a sanity check. Probably not needed, but it's an option.
 
 ---
 
 ## Approval gate
 
-Spec is **locked**. Next step: invoke `writing-plans` skill to convert this spec into a step-by-step implementation plan that maps each of the 8 steps to a discrete commit-able unit of work with file paths, verification commands, and rollback triggers.
+Spec is **locked at v3**. Saturday's first action is reading the diary + handoff + this spec, then starting Step 1 (backend GLB-URL split). No further design work; just execution.
