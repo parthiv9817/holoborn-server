@@ -7,10 +7,15 @@ results/
 tests/outputs/
 tests/captures/
 
-# Decompiled APK forensics — local reference only, 275MB
-drafts/legacy_apk/
+# Local-only artifacts — keep on disk, don't push to GitHub
+drafts/
+quest_outputs/
+quest_screenshots/
+Screenshot *.png
+Screenshot*.png
 
 .DS_Store
 .pytest_cache/
 .idea/
 .vscode/
+.superpowers/
