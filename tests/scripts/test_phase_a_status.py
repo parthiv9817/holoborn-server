@@ -42,6 +42,7 @@ CASES = [
         {"status": "generating", "last_runpod_status": "COMPLETED"},
         "generating", 100, "RunPod done, GLB downloading",
     ),
+    ({"status": "retexturing"}, "retexturing", 0, "Meshy retexture (de-light) in flight"),
     ({"status": "rigging"}, "rigging", 0, "Meshy rigging (future)"),
     ({"status": "animating"}, "animating", 0, "Meshy animating (future)"),
     ({"status": "failed", "error": "test failure"}, "failed", 0, "failed task"),

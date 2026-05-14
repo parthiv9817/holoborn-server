@@ -10,6 +10,7 @@ Env:  MESHY_API_KEY (real key or falls back to dummy with warning),
     python tests/scripts/test_meshy_manual.py path.glb --action-id 16
     python tests/scripts/test_meshy_manual.py --no-animation      # rigging only, no anim credits
     python tests/scripts/test_meshy_manual.py --model-url https://...  # bypass staging
+    python tests/scripts/test_meshy_manual.py --retexture --image-style path/to/portrait.png
 """
 from __future__ import annotations
 
@@ -185,6 +186,127 @@ async def run(input_glb: Path, model_url: str, key: str, action_id: int | None, 
         print(f"   OR drag-drop into https://gltf.report or https://playcanvas.com/viewer")
 
 
+async def run_retexture(
+    input_glb: Path,
+    model_url: str,
+    image_style_url: str,
+    key: str,
+) -> None:
+    """Test /retexture endpoint end-to-end. Mirrors run() shape."""
+    is_dummy = key == DUMMY_KEY
+    print(f"🎯 Input GLB:       {input_glb}  ({input_glb.stat().st_size:,} bytes)")
+    print(f"🌐 model_url:       {model_url}")
+    print(f"🖼️  image_style_url: {image_style_url}")
+    print(f"🔑 API key:         {_digest(key)}{'  ⚠️  DUMMY MODE — no real GLB will be produced' if is_dummy else ''}")
+    print(f"🤖 ai_model:        meshy-6")
+    print(f"⚙️  flags:           enable_pbr=true, enable_original_uv=false, remove_lighting=true, hd_texture=true")
+    print()
+
+    print("🔍 Verifying URLs reachable …")
+    glb_size = await _verify_url(model_url)
+    print(f"✅ model_url HEAD OK — Meshy will fetch {glb_size:,} bytes")
+    # Only verify image URL if it's our staged one (skip for arbitrary external URLs)
+    if "ngrok" in image_style_url or "localhost" in image_style_url:
+        img_size = await _verify_url(image_style_url)
+        print(f"✅ image_style_url HEAD OK — {img_size:,} bytes")
+    print()
+
+    t_total = time.perf_counter()
+
+    async with httpx.AsyncClient(timeout=60) as c:
+        # ── 1. Retexture ──────────────────────────────────────────────
+        print("⏳ POST /retexture …")
+        t = time.perf_counter()
+        body = {
+            "model_url": model_url,
+            "image_style_url": image_style_url,
+            "ai_model": "meshy-6",
+            "enable_pbr": True,
+            "enable_original_uv": False,   # False = Meshy regenerates proper UV unwrap (web UI default)
+            "remove_lighting": True,
+            "hd_texture": True,            # 4K base color — Pro plan
+            "target_formats": ["glb"],     # Only generate GLB, skip fbx/obj/usdz/stl (faster)
+        }
+        retex_id = await _post(c, key, "/retexture", body)
+        print(f"✅ retex_task_id = {retex_id}  ({time.perf_counter()-t:.1f}s)\n")
+
+        print(f"⏳ Polling /retexture/{retex_id} …")
+        retex_task = await _poll(c, key, f"/retexture/{retex_id}", "retex")
+        # model_urls is at TOP LEVEL of task (not under 'result') per Meshy docs
+        model_urls = retex_task.get("model_urls") or {}
+        print(f"✅ retexture SUCCEEDED  (consumed {retex_task.get('consumed_credits', 0)} credits)")
+        print(f"   model_urls keys: {list(model_urls.keys())}")
+        glb_url = model_urls.get("glb") or retex_task.get("model_url")
+        print(f"   glb url: {glb_url}")
+        print()
+
+        # ── 2. Download ───────────────────────────────────────────────
+        if not glb_url:
+            if is_dummy:
+                print("⚠️  No glb URL returned (expected in DUMMY MODE — model_urls empty)")
+                print("🎉 END-TO-END RETEXTURE PLUMBING TEST PASSED (dummy mode)")
+                print(f"   ✓ POST /retexture accepted  (request shape validated)")
+                print(f"   ✓ Polled task to SUCCEEDED  (auth + polling logic confirmed)")
+                print(f"   Total elapsed: {time.perf_counter()-t_total:.1f}s")
+                return
+            sys.exit("❌ No glb URL in retexture task result")
+
+        ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        out_path = GLB_OUT_DIR / f"retex_{ts}.glb"
+        print(f"⏳ Downloading → {out_path}")
+        try:
+            n = await _download(glb_url, out_path)
+        except RuntimeError as e:
+            if is_dummy:
+                print(f"⚠️  Download failed in DUMMY MODE: {e}")
+                print(f"⚠️  This is EXPECTED — dummy key returns mock URLs. Plumbing verified through polling.")
+                print(f"🎉 END-TO-END RETEXTURE PLUMBING TEST PASSED (dummy mode)")
+                print(f"   Total elapsed:  {time.perf_counter()-t_total:.1f}s")
+                return
+            sys.exit(f"❌ {e}")
+        print(f"✅ Downloaded {n:,} bytes  (magic = {GLB_MAGIC!r} ✓)")
+        print()
+
+        credits = retex_task.get("consumed_credits", 0) or 0
+        print("🎉 END-TO-END RETEXTURE TEST PASSED")
+        print(f"   Total elapsed: {time.perf_counter()-t_total:.1f}s")
+        print(f"   Output GLB:    {out_path}")
+        print(f"   Credits:       {credits}")
+        print()
+        print("View it:")
+        print(f"   open {out_path}")
+        print(f"   OR drag-drop into https://gltf.report")
+
+
+def _resolve_image_style_url(image_path: str | None, override_url: str | None) -> str:
+    """Stage a portrait image to AVATARS_DIR and return its public ngrok URL.
+
+    If override_url given, return it directly (no staging).
+    """
+    if override_url:
+        return override_url
+    if not image_path:
+        sys.exit(
+            "❌ --retexture requires --image-style <path> or --image-style-url <URL>\n"
+            "   Try: --image-style tests/inputs/v3_apose_test_portrait_b.png"
+        )
+    p = Path(image_path).resolve()
+    if not p.exists():
+        sys.exit(f"❌ image not found: {p}")
+    host = os.getenv("MESHY_PUBLIC_HOST", "").strip()
+    if not host:
+        sys.exit(
+            "❌ Need MESHY_PUBLIC_HOST set (e.g. grinning-flyable-golf.ngrok-free.dev)\n"
+            "   OR pass --image-style-url <direct URL> to skip staging."
+        )
+    ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    staged = AVATARS_DIR / f"meshy_style_{ts}{p.suffix}"
+    shutil.copy2(p, staged)
+    print(f"🖼️  Staged image → {staged}")
+    scheme = "http" if host.startswith(("localhost", "127.")) else "https"
+    return f"{scheme}://{host}/avatars/{staged.name}"
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Meshy rigging + animation manual test")
     p.add_argument("glb_path", nargs="?", help="Path to input TRELLIS GLB (default: latest manual_test_*.glb)")
@@ -192,6 +314,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--no-animation", action="store_true", help="Skip /animations call; download rigged-only GLB")
     p.add_argument("--model-url", help="Override staged URL with an externally-hosted model URL")
     p.add_argument("--height", type=float, default=DEFAULT_HEIGHT_M)
+    p.add_argument("--retexture", action="store_true",
+                   help="Test /retexture endpoint instead of /rigging+/animations")
+    p.add_argument("--image-style", help="Path to portrait image to use as image_style_url (--retexture only)")
+    p.add_argument("--image-style-url", help="Direct URL for image_style_url (skips staging)")
     return p.parse_args()
 
 
@@ -240,6 +366,10 @@ def main() -> None:
         key = DUMMY_KEY
     input_glb = _resolve_input(args.glb_path)
     model_url = _resolve_model_url(input_glb, args.model_url)
+    if args.retexture:
+        image_style_url = _resolve_image_style_url(args.image_style, args.image_style_url)
+        asyncio.run(run_retexture(input_glb, model_url, image_style_url, key))
+        return
     action_id = None if args.no_animation else args.action_id
     asyncio.run(run(input_glb, model_url, key, action_id, args.height))
 

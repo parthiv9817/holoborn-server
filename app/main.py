@@ -27,19 +27,22 @@ async def lifespan(app: FastAPI):
     app.state.face_detector = None
     app.state.pose_validator = None
 
+    # 2026-05-09: QUEST_TEST_MODE narrowed to skip MediaPipe BlazePose only.
+    # RunPod S3 client always initializes — the real generation pipeline runs
+    # in both modes (OpenAI bypass is separate via TEST_PORTRAIT_OVERRIDE).
     if settings.quest_test_mode:
-        log.warning("QUEST_TEST_MODE=ON — MediaPipe + RunPod S3 init skipped, endpoints will save uploads and return success without processing")
+        log.warning("QUEST_TEST_MODE=ON — MediaPipe BlazePose skipped on /validate-frame")
     else:
         app.state.face_detector = FaceDetector()
         app.state.pose_validator = PoseValidator()
         log.info("face_detector + pose_validator loaded")
 
-        s3 = get_s3_client()
-        s3.head_bucket(Bucket=settings.runpod_s3_bucket)
-        log.info(
-            "RunPod S3 ready: bucket=%s endpoint=%s",
-            settings.runpod_s3_bucket, settings.runpod_s3_endpoint,
-        )
+    s3 = get_s3_client()
+    s3.head_bucket(Bucket=settings.runpod_s3_bucket)
+    log.info(
+        "RunPod S3 ready: bucket=%s endpoint=%s",
+        settings.runpod_s3_bucket, settings.runpod_s3_endpoint,
+    )
 
     try:
         yield

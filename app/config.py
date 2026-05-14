@@ -74,11 +74,26 @@ class Settings(BaseSettings):
     runpod_poll_interval_s: float = 5.0
     runpod_poll_timeout_s: float = 600.0
 
+    # Meshy API (Retexture / Rigging / Animation endpoints).
+    # When meshy_api_key is empty, meshy_client falls back to the dummy test key
+    # `msy_dummy_api_key_for_test_mode_12345678` which returns mock responses.
+    # meshy_public_host is the ngrok host that serves staged GLBs + portraits
+    # back to Meshy (e.g. "grinning-flyable-golf.ngrok-free.dev").
+    meshy_api_key: str = ""
+    meshy_base_url: str = "https://api.meshy.ai/openapi/v1"
+    meshy_public_host: str = ""
+    meshy_poll_interval_s: float = 3.0
+    meshy_poll_timeout_s: float = 600.0
+
     host: str = "0.0.0.0"
     port: int = 8000
     log_level: str = "info"
 
     quest_test_mode: bool = True
+
+    # Test-mode bypasses for the spawn ritual demo while OpenAI billing is hard-limited.
+    test_portrait_override: str = ""   # path to a pre-cached portrait; skips OpenAI when set
+    test_portrait_delay_s: float = 0.0  # cinematic sleep before runpod submit (gives P2a vortex its window)
 
     @property
     def runpod_run_url(self) -> str:

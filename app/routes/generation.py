@@ -75,30 +75,9 @@ async def generate_multiview(request: Request) -> MultiviewResponse:
 
     metadata_raw = form.get("metadata") or ""
 
-    if settings.quest_test_mode:
-        task_id = str(uuid.uuid4())
-        ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-        scan_dir = QUEST_TEST_UPLOADS_DIR / f"multiview_{ts}_{task_id[:8]}"
-        scan_dir.mkdir(parents=True, exist_ok=True)
-
-        total_bytes = 0
-        for name, raw in zip(names, frames):
-            (scan_dir / f"{name}.jpg").write_bytes(raw)
-            total_bytes += len(raw)
-        if isinstance(metadata_raw, str) and metadata_raw:
-            (scan_dir / "metadata.json").write_text(clean_unity_str(metadata_raw))
-
-        request.app.state.generation_tasks[task_id] = {"status": "complete"}
-        log.info(
-            "[quest-test] /generate-multiview received %d frames (%d bytes) -> %s",
-            len(frames), total_bytes, scan_dir.name,
-        )
-        return MultiviewResponse(
-            status="processing",
-            task_id=task_id,
-            frames_received=len(frames),
-            message="quest-test mode: frames saved, no GPU pipeline triggered",
-        )
+    # NOTE: QUEST_TEST_MODE no longer short-circuits this endpoint. It now only
+    # affects /validate-frame (skip BlazePose). Real RunPod pipeline runs in
+    # both modes. OpenAI bypass is controlled separately via TEST_PORTRAIT_OVERRIDE.
 
     if isinstance(metadata_raw, str) and metadata_raw:
         try:
@@ -157,12 +136,8 @@ async def task_status(task_id: str, request: Request) -> TaskStatusResponse:
     if task is None:
         raise HTTPException(status_code=404, detail="unknown task_id")
 
-    if settings.quest_test_mode:
-        return TaskStatusResponse(
-            status="failed",
-            progress=0,
-            message="quest-test mode: GPU pipeline disabled, no GLB will be produced",
-        )
+    # NOTE: QUEST_TEST_MODE used to short-circuit here. Now it only affects
+    # /validate-frame; status reflects the real pipeline state regardless.
 
     glb_url = f"/avatars/{task_id}.glb"
     glb_path = AVATARS_DIR / f"{task_id}.glb"
@@ -179,7 +154,7 @@ async def task_status(task_id: str, request: Request) -> TaskStatusResponse:
             message=task.get("error") or "task failed",
         )
 
-    if status in ("portraitizing", "rigging", "animating"):
+    if status in ("portraitizing", "retexturing", "rigging", "animating"):
         return TaskStatusResponse(status=status, progress=0, glb_url=glb_url)
 
     if status == "generating":
