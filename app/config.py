@@ -59,6 +59,7 @@ class Settings(BaseSettings):
 
     openai_api_key: str = ""
     gpt_image_model: str = "gpt-image-1.5"
+    gpt_image_model_dual: str = "gpt-image-2"
 
     runpod_api_key: str = ""
     runpod_endpoint_id: str = "pz2c4wvo2rcdw9"
@@ -94,6 +95,13 @@ class Settings(BaseSettings):
     # Test-mode bypasses for the spawn ritual demo while OpenAI billing is hard-limited.
     test_portrait_override: str = ""   # path to a pre-cached portrait; skips OpenAI when set
     test_portrait_delay_s: float = 0.0  # cinematic sleep before runpod submit (gives P2a vortex its window)
+
+    # DRY-RUN mode: server accepts the multipart upload, saves frames + picks sharpest,
+    # then immediately marks task "complete" WITHOUT calling OpenAI / RunPod / Meshy.
+    # Zero downstream cost. Used to verify Quest is uploading the expected fields
+    # (e.g. body_*/face_* dual-capture wire format) without burning credits.
+    # Inspect results/scans/{ts}_{task_id}/ to confirm what arrived.
+    test_dry_run: bool = False
 
     @property
     def runpod_run_url(self) -> str:

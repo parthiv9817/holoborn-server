@@ -20,16 +20,22 @@ def parse_metadata(raw: str) -> list[dict[str, Any]]:
     return parsed
 
 
-async def collect_frames(form) -> tuple[list[bytes], list[str]]:
+async def collect_frames(form, prefix: str = "frame_") -> tuple[list[bytes], list[str]]:
+    """Collect uploaded files whose field name matches `{prefix}{int}`, ordered by index.
+
+    Default prefix "frame_" preserves the legacy single-burst contract. The dual-capture
+    flow calls this twice with prefix="body_" and prefix="face_" to pull two ordered bursts
+    out of one multipart submission.
+    """
     indices: list[tuple[int, str, UploadFile]] = []
     for key, value in form.multi_items():
         if not isinstance(value, UploadFile):
             continue
-        if not key.startswith("frame_"):
+        if not key.startswith(prefix):
             continue
         try:
-            idx = int(key.split("_", 1)[1])
-        except (IndexError, ValueError):
+            idx = int(key[len(prefix):])
+        except ValueError:
             continue
         indices.append((idx, key, value))
 

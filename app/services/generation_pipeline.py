@@ -24,7 +24,7 @@ from app.services.meshy_client import (
 )
 from app.services.meshy_client import poll_until_complete as meshy_poll_until_complete
 from app.services.meshy_client import submit_retexture
-from app.services.portraitizer import portraitize
+from app.services.portraitizer import portraitize, portraitize_dual
 from app.services.runpod_client import (
     GlbDownloadError,
     RunpodJobError,
@@ -56,35 +56,76 @@ def _graft_pbr():
 log = logging.getLogger(__name__)
 
 
+def _resolve_test_portrait_override() -> bytes | None:
+    """Shared bypass for both single and dual portraitize paths."""
+    if not settings.test_portrait_override:
+        return None
+    p = Path(settings.test_portrait_override)
+    if not p.is_absolute():
+        p = Path(__file__).resolve().parent.parent.parent / p
+    log.warning("TEST_PORTRAIT_OVERRIDE active — skipping OpenAI, using %s", p)
+    return p.read_bytes()
+
+
 async def _portraitize_async(jpeg_bytes: bytes) -> bytes:
     # TEST MODE: when settings.test_portrait_override is set, skip the OpenAI call
     # entirely and feed a pre-cached portrait directly into the TRELLIS pipeline.
     # Used to test end-to-end Quest spawn flow while OpenAI billing is hard-limited.
     # Status timing (portraitizing -> generating) is preserved for the spawn ritual.
-    if settings.test_portrait_override:
-        p = Path(settings.test_portrait_override)
-        if not p.is_absolute():
-            # Resolve relative to repo root (two dirs above app/services/).
-            p = Path(__file__).resolve().parent.parent.parent / p
-        log.warning("TEST_PORTRAIT_OVERRIDE active — skipping OpenAI, using %s", p)
-        return p.read_bytes()
+    override = _resolve_test_portrait_override()
+    if override is not None:
+        return override
     return await asyncio.to_thread(portraitize, jpeg_bytes)
+
+
+async def _portraitize_async_dual(body_jpeg: bytes, face_jpeg: bytes) -> bytes:
+    """Dual-input portraitizer (body + face) via gpt-image-2. Honors override."""
+    override = _resolve_test_portrait_override()
+    if override is not None:
+        return override
+    return await asyncio.to_thread(portraitize_dual, body_jpeg, face_jpeg)
 
 
 async def process_task(
     task_id: str,
-    averaged_jpeg: bytes,
+    body_jpeg: bytes,
     scan_dir: Path,
     task_record: dict,
+    *,
+    face_jpeg: bytes | None = None,
 ) -> None:
     """Background pipeline: portraitize -> runpod submit -> poll -> download -> delete.
+
+    If `face_jpeg` is provided, runs the dual-input portraitizer (gpt-image-2);
+    otherwise the legacy single-input path (gpt-image-1.5). All downstream
+    stages (RunPod, Meshy Retex, Meshy Rigging, graft) are mode-agnostic.
 
     Mutates task_record in place to communicate progress/status to /status route.
     """
     try:
+        # DRY-RUN: bail after the route has already saved frames + picked sharpest.
+        # Marks the task complete so /status returns "complete" without firing any
+        # downstream cost (OpenAI / RunPod / Meshy). Quest's poll will end cleanly.
+        if settings.test_dry_run:
+            log.warning(
+                "[task %s] TEST_DRY_RUN active — skipping portraitize+runpod+meshy. "
+                "Inputs saved at %s. Mode=%s",
+                task_id, scan_dir,
+                "dual" if face_jpeg is not None else "single",
+            )
+            task_record["status"] = "complete"
+            task_record["portrait_mode"] = "dual" if face_jpeg is not None else "single"
+            task_record["dry_run"] = True
+            return
+
         task_record["status"] = "portraitizing"
         t1 = time.perf_counter()
-        portrait_bytes = await _portraitize_async(averaged_jpeg)
+        if face_jpeg is not None:
+            portrait_bytes = await _portraitize_async_dual(body_jpeg, face_jpeg)
+            task_record["portrait_mode"] = "dual"
+        else:
+            portrait_bytes = await _portraitize_async(body_jpeg)
+            task_record["portrait_mode"] = "single"
         log.info(
             "[task %s] portraitize elapsed=%.2fs bytes=%d",
             task_id, time.perf_counter() - t1, len(portrait_bytes),

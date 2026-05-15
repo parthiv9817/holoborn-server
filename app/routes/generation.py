@@ -20,7 +20,7 @@ from app.services.multipart_utils import (
     collect_frames,
     parse_metadata,
 )
-from app.services.preprocessing import burst_average
+from app.services.preprocessing import burst_average, pick_sharpest
 
 
 router = APIRouter()
@@ -69,9 +69,20 @@ async def validate_frame(request: Request) -> FramingResponse:
 @router.post("/generate-multiview", response_model=MultiviewResponse)
 async def generate_multiview(request: Request) -> MultiviewResponse:
     form = await request.form()
-    frames, names = await collect_frames(form)
-    if not frames:
-        raise HTTPException(status_code=400, detail="no frame_* fields found")
+
+    body_frames, body_names = await collect_frames(form, prefix="body_")
+    face_frames, face_names = await collect_frames(form, prefix="face_")
+    legacy_frames, legacy_names = await collect_frames(form)
+
+    # Dual mode requires BOTH bursts. If only one prefix is present (or only
+    # legacy frames), we fall back to the single-input path.
+    dual_mode = bool(body_frames and face_frames)
+
+    if not dual_mode and not legacy_frames:
+        raise HTTPException(
+            status_code=400,
+            detail="no frame_* / body_* / face_* fields found",
+        )
 
     metadata_raw = form.get("metadata") or ""
 
@@ -90,23 +101,45 @@ async def generate_multiview(request: Request) -> MultiviewResponse:
     scan_dir = SCANS_DIR / f"{ts}_{task_id[:8]}"
     scan_dir.mkdir(parents=True, exist_ok=True)
 
-    for name, raw in zip(names, frames):
-        (scan_dir / f"{name}.jpg").write_bytes(raw)
     if isinstance(metadata_raw, str) and metadata_raw:
         (scan_dir / "metadata.json").write_text(clean_unity_str(metadata_raw))
 
-    t0 = time.perf_counter()
-    averaged = burst_average(frames)
-    cv2.imwrite(str(scan_dir / "averaged.jpg"), averaged)
-    log.info(
-        "[task %s] burst_avg elapsed=%.2fs shape=%s frames=%d",
-        task_id, time.perf_counter() - t0, averaged.shape, len(frames),
-    )
+    body_jpeg: bytes
+    face_jpeg: bytes | None = None
+    frames_received: int
 
-    ok, encoded = cv2.imencode(".jpg", averaged, [cv2.IMWRITE_JPEG_QUALITY, 95])
-    if not ok:
-        raise HTTPException(status_code=500, detail="failed to encode averaged frame")
-    averaged_jpeg = encoded.tobytes()
+    if dual_mode:
+        for name, raw in zip(body_names + face_names, body_frames + face_frames):
+            (scan_dir / f"{name}.jpg").write_bytes(raw)
+
+        t0 = time.perf_counter()
+        body_jpeg, body_idx, body_score = pick_sharpest(body_frames)
+        face_jpeg, face_idx, face_score = pick_sharpest(face_frames)
+        (scan_dir / "body_sharpest.jpg").write_bytes(body_jpeg)
+        (scan_dir / "face_sharpest.jpg").write_bytes(face_jpeg)
+        log.info(
+            "[task %s] dual-pick elapsed=%.2fs body=idx%d/score%.1f face=idx%d/score%.1f",
+            task_id, time.perf_counter() - t0,
+            body_idx, body_score, face_idx, face_score,
+        )
+        frames_received = len(body_frames) + len(face_frames)
+    else:
+        for name, raw in zip(legacy_names, legacy_frames):
+            (scan_dir / f"{name}.jpg").write_bytes(raw)
+
+        t0 = time.perf_counter()
+        averaged = burst_average(legacy_frames)
+        cv2.imwrite(str(scan_dir / "averaged.jpg"), averaged)
+        log.info(
+            "[task %s] burst_avg elapsed=%.2fs shape=%s frames=%d",
+            task_id, time.perf_counter() - t0, averaged.shape, len(legacy_frames),
+        )
+
+        ok, encoded = cv2.imencode(".jpg", averaged, [cv2.IMWRITE_JPEG_QUALITY, 95])
+        if not ok:
+            raise HTTPException(status_code=500, detail="failed to encode averaged frame")
+        body_jpeg = encoded.tobytes()
+        frames_received = len(legacy_frames)
 
     task_record = {
         "status": "processing",
@@ -116,15 +149,18 @@ async def generate_multiview(request: Request) -> MultiviewResponse:
         "last_runpod_status": "PENDING",
         "glb_path": None,
         "error": None,
+        "mode": "dual" if dual_mode else "single",
     }
     request.app.state.generation_tasks[task_id] = task_record
 
-    asyncio.create_task(process_task(task_id, averaged_jpeg, scan_dir, task_record))
+    asyncio.create_task(
+        process_task(task_id, body_jpeg, scan_dir, task_record, face_jpeg=face_jpeg)
+    )
 
     return MultiviewResponse(
         status="processing",
         task_id=task_id,
-        frames_received=len(frames),
+        frames_received=frames_received,
         message="job accepted",
     )
 
