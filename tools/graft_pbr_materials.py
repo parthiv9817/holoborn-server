@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import io
 import json
 import struct
 import sys
@@ -30,6 +31,59 @@ from typing import Any
 
 GLB_MAGIC = b"glTF"
 GLB_VERSION = 2
+
+# Defensive infrastructure against Meshy's upstream retex roughness drift.
+# Meshy began outputting metalRough maps with G-channel mean ~138 (mid-gloss)
+# around 2026-05-19; pre-regression GLBs had mean ~252 (fully matte). We clamp
+# G to a floor at graft time so every production GLB lands in the matte zone.
+# Council-validated floor=200 (2026-05-20) — see diaries/2026-05-20.md.
+DEFAULT_ROUGHNESS_FLOOR = 200
+DEFAULT_JPEG_QUALITY = 92
+
+
+def _clamp_metalrough_jpeg(
+    jpeg_bytes: bytes,
+    floor: int,
+    zero_metallic: bool,
+    jpeg_quality: int = DEFAULT_JPEG_QUALITY,
+) -> tuple[bytes, dict[str, float]]:
+    """Clamp the metalRough texture's G (roughness) channel to >= floor and
+    optionally zero the B (metallic) channel. Returns (new_jpeg_bytes, stats).
+
+    glTF metalRough convention: R=ignored, G=roughness, B=metallic, A=ignored.
+    Higher G = more matte (255 = fully matte, 0 = mirror-glossy).
+    """
+    from PIL import Image
+
+    img = Image.open(io.BytesIO(jpeg_bytes)).convert("RGB")
+    w, h = img.size
+    r_band, g_band, b_band = img.split()
+    g_in = list(g_band.getdata())
+    b_in = list(b_band.getdata())
+    g_mean_before = sum(g_in) / len(g_in)
+    b_mean_before = sum(b_in) / len(b_in)
+
+    g_out = bytes(max(v, floor) for v in g_in)
+    b_out = bytes(0 for _ in b_in) if zero_metallic else b_band.tobytes()
+
+    new_img = Image.merge("RGB", (
+        r_band,
+        Image.frombytes("L", (w, h), g_out),
+        Image.frombytes("L", (w, h), b_out),
+    ))
+    buf = io.BytesIO()
+    new_img.save(buf, format="JPEG", quality=jpeg_quality, optimize=True)
+    new_bytes = buf.getvalue()
+
+    return new_bytes, {
+        "dimensions": f"{w}x{h}",
+        "jpeg_bytes_before": len(jpeg_bytes),
+        "jpeg_bytes_after": len(new_bytes),
+        "g_mean_before": g_mean_before,
+        "g_mean_after": sum(g_out) / len(g_out),
+        "b_mean_before": b_mean_before,
+        "b_mean_after": sum(b_out) / len(b_out),
+    }
 
 
 def parse_glb(path: Path) -> tuple[dict[str, Any], bytes]:
@@ -97,11 +151,24 @@ def verify_compatible(retex: dict[str, Any], rigged: dict[str, Any]) -> None:
     )
 
 
-def graft(retex_path: Path, rigged_path: Path, out_path: Path) -> dict[str, Any]:
-    """Returns a summary dict for printing."""
+def graft(
+    retex_path: Path,
+    rigged_path: Path,
+    out_path: Path,
+    roughness_floor: int = DEFAULT_ROUGHNESS_FLOOR,
+    zero_metallic: bool = True,
+    jpeg_quality: int = DEFAULT_JPEG_QUALITY,
+) -> dict[str, Any]:
+    """Returns a summary dict for printing.
+
+    roughness_floor: G-channel floor applied to the metalRough JPEG (0 disables).
+    zero_metallic: if True, force B channel to 0 (suppress spurious metallic).
+    """
     retex_gltf, retex_bin = parse_glb(retex_path)
     rigged_gltf, rigged_bin = parse_glb(rigged_path)
     verify_compatible(retex_gltf, rigged_gltf)
+    clamp_active = roughness_floor > 0 or zero_metallic
+    clamp_stats: dict[str, float] | None = None
 
     # ── Start from the rigged GLB (preserves nodes/skins/animations/mesh attrs) ──
     out_gltf = copy.deepcopy(rigged_gltf)
@@ -144,6 +211,12 @@ def graft(retex_path: Path, rigged_path: Path, out_path: Path) -> dict[str, Any]
         if key in retex_material:
             texture_refs.append((key, retex_material[key]))
 
+    # Resolve the metalRough image index up-front so append_image can clamp it.
+    metalrough_img_idx: int | None = None
+    if "metallicRoughnessTexture" in pbr:
+        t_idx = pbr["metallicRoughnessTexture"]["index"]
+        metalrough_img_idx = retex_gltf["textures"][t_idx].get("source")
+
     # ── Append retex bufferViews referenced by images, build index remap ──
     new_buffer_idx = 0  # rigged GLB has buffer[0]; we append to that
     bv_remap: dict[int, int] = {}  # retex bufferView idx → new idx
@@ -153,6 +226,7 @@ def graft(retex_path: Path, rigged_path: Path, out_path: Path) -> dict[str, Any]
 
     def append_image(retex_img_idx: int) -> int:
         """Copy a retex image (+ its bufferView data) into the rigged GLB. Returns new image idx."""
+        nonlocal clamp_stats
         if retex_img_idx in img_remap:
             return img_remap[retex_img_idx]
         img = copy.deepcopy(retex_gltf["images"][retex_img_idx])
@@ -160,6 +234,11 @@ def graft(retex_path: Path, rigged_path: Path, out_path: Path) -> dict[str, Any]
             retex_bv_idx = img["bufferView"]
             if retex_bv_idx not in bv_remap:
                 bv_bytes = get_bufferview_bytes(retex_bin, retex_gltf, retex_bv_idx)
+                # Defensive clamp on the metalRough texture before appending.
+                if clamp_active and retex_img_idx == metalrough_img_idx:
+                    bv_bytes, clamp_stats = _clamp_metalrough_jpeg(
+                        bv_bytes, roughness_floor, zero_metallic, jpeg_quality
+                    )
                 # Append to rigged BIN (4-byte align before append for safety)
                 while len(out_bin) % 4 != 0:
                     out_bin.append(0)
@@ -224,6 +303,10 @@ def graft(retex_path: Path, rigged_path: Path, out_path: Path) -> dict[str, Any]
         "n_materials": len(out_gltf["materials"]),
         "n_animations": len(out_gltf.get("animations", [])),
         "n_skins": len(out_gltf.get("skins", [])),
+        "clamp_active": clamp_active,
+        "clamp_floor": roughness_floor,
+        "clamp_zero_metallic": zero_metallic,
+        "clamp_stats": clamp_stats,
     }
 
 
@@ -232,6 +315,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--retex", required=True, type=Path, help="Premium retex GLB (PBR source)")
     p.add_argument("--rigged", required=True, type=Path, help="Rigged+animated GLB (target)")
     p.add_argument("--out", required=True, type=Path, help="Output grafted GLB path")
+    p.add_argument("--roughness-floor", type=int, default=DEFAULT_ROUGHNESS_FLOOR,
+                   help=f"clamp metalRough G channel floor (0 disables). Default {DEFAULT_ROUGHNESS_FLOOR}.")
+    p.add_argument("--keep-metallic", action="store_true",
+                   help="preserve B channel (skip metallic zeroing). Default off → B forced to 0.")
+    p.add_argument("--jpeg-quality", type=int, default=DEFAULT_JPEG_QUALITY,
+                   help=f"re-encode quality when clamping. Default {DEFAULT_JPEG_QUALITY}.")
     return p.parse_args()
 
 
@@ -243,7 +332,12 @@ def main() -> int:
         sys.exit(f"rigged GLB not found: {args.rigged}")
     args.out.parent.mkdir(parents=True, exist_ok=True)
 
-    summary = graft(args.retex, args.rigged, args.out)
+    summary = graft(
+        args.retex, args.rigged, args.out,
+        roughness_floor=args.roughness_floor,
+        zero_metallic=not args.keep_metallic,
+        jpeg_quality=args.jpeg_quality,
+    )
     mb = lambda n: f"{n/1024/1024:.1f} MB"
     print(f"  retex:  {mb(summary['retex_size'])}  ({args.retex})")
     print(f"  rigged: {mb(summary['rigged_size'])}  ({args.rigged})")
@@ -252,6 +346,19 @@ def main() -> int:
     print(f"  textures={summary['n_textures']}  images={summary['n_images']}  "
           f"samplers={summary['n_samplers']}  materials={summary['n_materials']}")
     print(f"  animations={summary['n_animations']}  skins={summary['n_skins']}  (preserved)")
+    if summary["clamp_active"]:
+        cs = summary["clamp_stats"]
+        if cs is not None:
+            print(f"  clamp: floor={summary['clamp_floor']}  "
+                  f"zero_metallic={summary['clamp_zero_metallic']}  "
+                  f"({cs['dimensions']})")
+            print(f"    roughness G mean: {cs['g_mean_before']:.1f} → {cs['g_mean_after']:.1f}")
+            print(f"    metallic  B mean: {cs['b_mean_before']:.1f} → {cs['b_mean_after']:.1f}")
+            print(f"    metalRough JPEG : {cs['jpeg_bytes_before']:,} → {cs['jpeg_bytes_after']:,} bytes")
+        else:
+            print(f"  clamp: configured but no metalRough texture found (skipped)")
+    else:
+        print(f"  clamp: disabled")
     return 0
 
 
