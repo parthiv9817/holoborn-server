@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import functools
 import logging
 import shutil
 import sys
@@ -21,9 +22,16 @@ from app.services.meshy_client import (
     download_retexture_glb,
     extract_glb_url,
     is_dummy_mode as meshy_is_dummy_mode,
+    run_with_transient_retry,
 )
 from app.services.meshy_client import poll_until_complete as meshy_poll_until_complete
 from app.services.meshy_client import submit_retexture
+from app.services.hunyuan_client import (
+    poll_until_complete as hunyuan_poll,
+)
+from app.services.hunyuan_client import (
+    submit_job as hunyuan_submit,
+)
 from app.services.portraitizer import portraitize, portraitize_dual
 from app.services.runpod_client import (
     GlbDownloadError,
@@ -33,6 +41,7 @@ from app.services.runpod_client import (
     poll_until_complete,
     submit_job,
 )
+from app.services.view_synthesizer import synthesize_views_grid
 
 # tools/graft_pbr_materials.py — restores PBR materials onto rigged GLB
 # (Meshy rigging strips the metallic/roughness/normal/emissive textures;
@@ -133,8 +142,6 @@ async def process_task(
         (scan_dir / "portrait.png").write_bytes(portrait_bytes)
         task_record["portrait_path"] = str(scan_dir / "portrait.png")
 
-        image_b64 = base64.b64encode(portrait_bytes).decode("ascii")
-
         # Cinematic delay — gives the P2a vortex its full window when the
         # portraitizer is bypassed (real OpenAI takes 30-60s; bypass takes ms).
         # Set TEST_PORTRAIT_DELAY_S=30 in .env to enable. 0 = skip.
@@ -147,16 +154,46 @@ async def process_task(
 
         task_record["status"] = "generating"
         t2 = time.perf_counter()
-        runpod_job_id = await submit_job(image_b64)
-        task_record["job_id"] = runpod_job_id
-        task_record["last_runpod_status"] = "IN_QUEUE"
-        log.info(
-            "[task %s] submitted job=%s elapsed=%.2fs",
-            task_id, runpod_job_id, time.perf_counter() - t2,
-        )
 
-        t3 = time.perf_counter()
-        output = await poll_until_complete(runpod_job_id)
+        if settings.use_hunyuan:
+            # Hunyuan multi-view path: synthesize 4 turnaround views from the
+            # single front portrait, then submit all 4 to the Hunyuan endpoint
+            # (itd7oz9wexb1oo). Downstream Meshy retex/rig/graft is identical
+            # — same S3 volume, same Meshy flow.
+            log.info("[task %s] USE_HUNYUAN=true — routing via Hunyuan endpoint", task_id)
+            tv = time.perf_counter()
+            views = await asyncio.to_thread(synthesize_views_grid, portrait_bytes)
+            log.info(
+                "[task %s] view-gen elapsed=%.2fs views=%s",
+                task_id, time.perf_counter() - tv, list(views.keys()),
+            )
+            for view_name, png in views.items():
+                (scan_dir / f"view_{view_name}.png").write_bytes(png)
+
+            runpod_job_id = await hunyuan_submit(views)
+            task_record["pipeline_mode"] = "hunyuan"
+            task_record["job_id"] = runpod_job_id
+            task_record["last_runpod_status"] = "IN_QUEUE"
+            log.info(
+                "[task %s] submitted Hunyuan job=%s elapsed=%.2fs",
+                task_id, runpod_job_id, time.perf_counter() - t2,
+            )
+            t3 = time.perf_counter()
+            output = await hunyuan_poll(runpod_job_id)
+        else:
+            # TRELLIS path (production default).
+            image_b64 = base64.b64encode(portrait_bytes).decode("ascii")
+            runpod_job_id = await submit_job(image_b64)
+            task_record["pipeline_mode"] = "trellis"
+            task_record["job_id"] = runpod_job_id
+            task_record["last_runpod_status"] = "IN_QUEUE"
+            log.info(
+                "[task %s] submitted TRELLIS job=%s elapsed=%.2fs",
+                task_id, runpod_job_id, time.perf_counter() - t2,
+            )
+            t3 = time.perf_counter()
+            output = await poll_until_complete(runpod_job_id)
+
         task_record["last_runpod_status"] = "COMPLETED"
         log.info(
             "[task %s] runpod completed elapsed=%.2fs output_keys=%s",
@@ -213,29 +250,38 @@ async def process_task(
         portrait_url = f"{base}/avatars/{portrait_staged.name}"
 
         task_record["status"] = "retexturing"
-        try:
-            t5 = time.perf_counter()
-            retex_task_id = await submit_retexture(
-                model_url=model_url,
-                image_style_url=portrait_url,
-                ai_model="meshy-6",
-                enable_pbr=True,
-                enable_original_uv=False,   # False = Meshy regenerates proper UV unwrap (matches web UI)
-                remove_lighting=True,
-                hd_texture=True,            # 4K base color — meshy-6 + Pro plan
-                target_formats=["glb"],     # Only GLB — skip fbx/obj/usdz/stl (faster)
-            )
-            task_record["meshy_retexture_id"] = retex_task_id
+
+        def _note_retex_submit(rid: str) -> None:
+            task_record["meshy_retexture_id"] = rid
             log.info(
-                "[task %s] meshy retexture submitted id=%s dummy=%s elapsed=%.2fs",
-                task_id, retex_task_id, meshy_is_dummy_mode(), time.perf_counter() - t5,
+                "[task %s] meshy retexture submitted id=%s dummy=%s",
+                task_id, rid, meshy_is_dummy_mode(),
             )
 
-            t6 = time.perf_counter()
-            retex_task = await meshy_poll_until_complete(retex_task_id)
+        try:
+            t5 = time.perf_counter()
+            # Retries the whole submit+poll on a transient service_unavailable
+            # blip (Meshy's "please retry") so one unlucky 2s window can't doom
+            # the avatar to the unpainted fallback below.
+            retex_task = await run_with_transient_retry(
+                functools.partial(
+                    submit_retexture,
+                    model_url=model_url,
+                    image_style_url=portrait_url,
+                    ai_model="meshy-6",
+                    enable_pbr=True,
+                    enable_original_uv=False,   # False = Meshy regenerates proper UV unwrap (matches web UI)
+                    remove_lighting=True,
+                    hd_texture=True,            # 4K base color — meshy-6 + Pro plan
+                    target_formats=["glb"],     # Only GLB — skip fbx/obj/usdz/stl (faster)
+                ),
+                meshy_poll_until_complete,
+                label="retexture",
+                on_submit=_note_retex_submit,
+            )
             log.info(
                 "[task %s] meshy retexture completed elapsed=%.2fs",
-                task_id, time.perf_counter() - t6,
+                task_id, time.perf_counter() - t5,
             )
 
             clean_url = extract_glb_url(retex_task)
@@ -273,22 +319,26 @@ async def process_task(
             try:
                 retex_public_url = f"{base}/avatars/{final_path.name}"
 
-                t8 = time.perf_counter()
-                rig_task_id = await submit_rigging(
-                    model_url=retex_public_url,
-                    height_meters=1.7,
-                )
-                task_record["meshy_rigging_id"] = rig_task_id
-                log.info(
-                    "[task %s] meshy rigging submitted id=%s elapsed=%.2fs",
-                    task_id, rig_task_id, time.perf_counter() - t8,
-                )
+                def _note_rig_submit(rid: str) -> None:
+                    task_record["meshy_rigging_id"] = rid
+                    log.info("[task %s] meshy rigging submitted id=%s", task_id, rid)
 
-                t9 = time.perf_counter()
-                rig_task = await poll_rigging_until_complete(rig_task_id)
+                t8 = time.perf_counter()
+                # Same transient-retry guard as retex — a service_unavailable
+                # blip here would otherwise fall back to the un-rigged retex.
+                rig_task = await run_with_transient_retry(
+                    functools.partial(
+                        submit_rigging,
+                        model_url=retex_public_url,
+                        height_meters=1.7,
+                    ),
+                    poll_rigging_until_complete,
+                    label="rigging",
+                    on_submit=_note_rig_submit,
+                )
                 log.info(
                     "[task %s] meshy rigging completed elapsed=%.2fs",
-                    task_id, time.perf_counter() - t9,
+                    task_id, time.perf_counter() - t8,
                 )
 
                 rigged_remote_url = extract_rigged_glb_url(rig_task)

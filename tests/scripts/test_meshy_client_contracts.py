@@ -5,6 +5,7 @@ Run:
 """
 from __future__ import annotations
 
+import asyncio
 import sys
 from pathlib import Path
 
@@ -18,7 +19,14 @@ from app.services.meshy_animation_client import (  # noqa: E402
     extract_basic_animation_url,
     extract_rigged_glb_url,
 )
-from app.services.meshy_client import build_retexture_body, extract_glb_url  # noqa: E402
+from app.services.meshy_client import (  # noqa: E402
+    MeshyJobError,
+    MeshyTransientError,
+    build_retexture_body,
+    extract_glb_url,
+    is_transient_error,
+    run_with_transient_retry,
+)
 
 
 def test_retexture_body_includes_quality_flags() -> None:
@@ -80,6 +88,95 @@ def test_extract_animation_glb_url() -> None:
     assert extract_animation_glb_url(task) == "https://assets.meshy.ai/idle.glb"
 
 
+def test_is_transient_error_only_for_service_unavailable() -> None:
+    # The exact shape Meshy returned on 2026-05-23.
+    assert is_transient_error(
+        {"type": "service_unavailable",
+         "message": "The generation service is temporarily unavailable. Please retry."}
+    ) is True
+    # Message-only fallback (type missing).
+    assert is_transient_error({"message": "Service temporarily unavailable"}) is True
+    # String form.
+    assert is_transient_error("service_unavailable: retry") is True
+    # Hard errors must NOT be classified transient (would loop forever).
+    assert is_transient_error({"type": "internal_error", "message": "bad input"}) is False
+    assert is_transient_error("invalid model_url 404") is False
+    assert is_transient_error(None) is False
+
+
+def test_retry_recovers_after_transient_blips() -> None:
+    calls = {"submit": 0, "poll": 0}
+    submitted: list[str] = []
+
+    async def fake_submit() -> str:
+        calls["submit"] += 1
+        return f"task-{calls['submit']}"
+
+    async def fake_poll(task_id: str) -> dict:
+        calls["poll"] += 1
+        if calls["poll"] < 3:
+            raise MeshyTransientError(f"{task_id} service_unavailable")
+        return {"id": task_id, "status": "SUCCEEDED"}
+
+    result = asyncio.run(
+        run_with_transient_retry(
+            fake_submit, fake_poll,
+            label="retexture", max_attempts=3, backoff_s=0,
+            on_submit=submitted.append,
+        )
+    )
+    assert result["status"] == "SUCCEEDED"
+    assert calls["submit"] == 3            # a fresh submit per retry
+    assert submitted == ["task-1", "task-2", "task-3"]
+
+
+def test_retry_does_not_swallow_hard_errors() -> None:
+    calls = {"submit": 0}
+
+    async def fake_submit() -> str:
+        calls["submit"] += 1
+        return "task"
+
+    async def fake_poll(task_id: str) -> dict:
+        raise MeshyJobError("hard failure — bad input")
+
+    raised = False
+    try:
+        asyncio.run(
+            run_with_transient_retry(
+                fake_submit, fake_poll, label="retexture", max_attempts=3, backoff_s=0,
+            )
+        )
+    except MeshyJobError as e:
+        raised = True
+        assert not isinstance(e, MeshyTransientError)
+    assert raised
+    assert calls["submit"] == 1            # non-transient → no retry
+
+
+def test_retry_exhausts_then_raises_transient() -> None:
+    calls = {"submit": 0}
+
+    async def fake_submit() -> str:
+        calls["submit"] += 1
+        return "task"
+
+    async def fake_poll(task_id: str) -> dict:
+        raise MeshyTransientError("still unavailable")
+
+    raised = False
+    try:
+        asyncio.run(
+            run_with_transient_retry(
+                fake_submit, fake_poll, label="rigging", max_attempts=3, backoff_s=0,
+            )
+        )
+    except MeshyTransientError:
+        raised = True
+    assert raised
+    assert calls["submit"] == 3            # tried exactly max_attempts times
+
+
 def run() -> int:
     tests = [
         test_retexture_body_includes_quality_flags,
@@ -88,6 +185,10 @@ def run() -> int:
         test_animation_body_uses_rig_task_and_action,
         test_extract_rigging_urls,
         test_extract_animation_glb_url,
+        test_is_transient_error_only_for_service_unavailable,
+        test_retry_recovers_after_transient_blips,
+        test_retry_does_not_swallow_hard_errors,
+        test_retry_exhausts_then_raises_transient,
     ]
     for test in tests:
         test()

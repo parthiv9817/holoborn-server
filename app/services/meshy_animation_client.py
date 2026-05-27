@@ -8,7 +8,13 @@ from typing import Any
 import httpx
 
 from app.config import settings
-from app.services.meshy_client import MeshyJobError, _headers, is_dummy_mode
+from app.services.meshy_client import (
+    MeshyJobError,
+    MeshyTransientError,
+    _headers,
+    is_dummy_mode,
+    is_transient_error,
+)
 
 
 log = logging.getLogger(__name__)
@@ -139,7 +145,10 @@ async def _poll_task(path: str, task_id: str, label: str) -> dict[str, Any]:
             return task
         if status in {"FAILED", "CANCELED"}:
             err = task.get("task_error") or status.lower()
-            raise MeshyJobError(f"meshy {label} {task_id} {status}: {err}")
+            msg = f"meshy {label} {task_id} {status}: {err}"
+            if is_transient_error(err):
+                raise MeshyTransientError(msg)
+            raise MeshyJobError(msg)
         if loop.time() > deadline:
             raise TimeoutError(
                 f"meshy {label} {task_id} did not complete in "

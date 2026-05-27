@@ -19,3 +19,6 @@ Screenshot*.png
 .idea/
 .vscode/
 .superpowers/
+
+# Internal admin docs (effort sheets w/ team data) — never push
+admin/

@@ -65,6 +65,14 @@ class Settings(BaseSettings):
     runpod_endpoint_id: str = "pz2c4wvo2rcdw9"
     gpu_server_url: str = "https://api.runpod.ai/v2/pz2c4wvo2rcdw9"
 
+    # Hunyuan multi-view path (deployed 2026-05-23). Off by default.
+    # When use_hunyuan=True, generation_pipeline swaps TRELLIS submit for the
+    # Hunyuan submit (view_synthesizer + hunyuan_client). Downstream Meshy
+    # retex+rig+graft stays identical.
+    use_hunyuan: bool = False
+    runpod_hunyuan_endpoint_id: str = "itd7oz9wexb1oo"
+    gpu_hunyuan_server_url: str = "https://api.runpod.ai/v2/itd7oz9wexb1oo"
+
     runpod_s3_access_key: str = ""
     runpod_s3_secret_key: str = ""
     runpod_s3_endpoint: str = ""
@@ -85,6 +93,13 @@ class Settings(BaseSettings):
     meshy_public_host: str = ""
     meshy_poll_interval_s: float = 3.0
     meshy_poll_timeout_s: float = 600.0
+    # Meshy occasionally rejects a job with `service_unavailable` ("temporarily
+    # unavailable, please retry") — a transient capacity blip that self-heals in
+    # ~90s (verified 2026-05-23: failed at 12:46 + 19:00, succeeded 12:47/12:51/
+    # 17:45 same config). Retry the whole submit+poll on that specific error so a
+    # single blip can't doom an avatar to the unpainted fallback.
+    meshy_max_attempts: int = 3
+    meshy_retry_backoff_s: float = 12.0
 
     host: str = "0.0.0.0"
     port: int = 8000
@@ -110,6 +125,14 @@ class Settings(BaseSettings):
     @property
     def runpod_status_url_base(self) -> str:
         return f"{self.gpu_server_url}/status"
+
+    @property
+    def hunyuan_run_url(self) -> str:
+        return f"{self.gpu_hunyuan_server_url}/run"
+
+    @property
+    def hunyuan_status_url_base(self) -> str:
+        return f"{self.gpu_hunyuan_server_url}/status"
 
 
 settings = Settings()

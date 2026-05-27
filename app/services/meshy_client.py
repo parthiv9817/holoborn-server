@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
@@ -22,8 +23,35 @@ class MeshyJobError(RuntimeError):
     pass
 
 
+class MeshyTransientError(MeshyJobError):
+    """Retryable Meshy failure — Meshy's service was momentarily unavailable
+    and explicitly asked us to retry. Subclass of MeshyJobError so existing
+    fallback `except MeshyJobError` clauses still catch it if retries exhaust.
+    """
+
+
 class MeshyDownloadError(RuntimeError):
     pass
+
+
+# Meshy task_error `type` values that are transient (capacity blips) and worth
+# retrying. A wrong model_url or bad input fails with a DIFFERENT type and must
+# NOT be retried (it would fail identically every attempt).
+_TRANSIENT_ERROR_TYPES = {"service_unavailable"}
+
+
+def is_transient_error(task_error: Any) -> bool:
+    """True when a Meshy task_error is a retryable capacity blip."""
+    if isinstance(task_error, dict):
+        etype = (task_error.get("type") or "").lower()
+        if etype in _TRANSIENT_ERROR_TYPES:
+            return True
+        msg = (task_error.get("message") or "").lower()
+        return "temporarily unavailable" in msg
+    if isinstance(task_error, str):
+        low = task_error.lower()
+        return "service_unavailable" in low or "temporarily unavailable" in low
+    return False
 
 
 def _resolve_key() -> str:
@@ -158,7 +186,10 @@ async def poll_until_complete(task_id: str) -> dict[str, Any]:
             return task
         if status in {"FAILED", "CANCELED"}:
             err = task.get("task_error") or status.lower()
-            raise MeshyJobError(f"meshy retexture {task_id} {status}: {err}")
+            msg = f"meshy retexture {task_id} {status}: {err}"
+            if is_transient_error(err):
+                raise MeshyTransientError(msg)
+            raise MeshyJobError(msg)
         if loop.time() > deadline:
             raise TimeoutError(
                 f"meshy retexture {task_id} did not complete in "
@@ -194,3 +225,43 @@ async def download_retexture_glb(url: str, local_path: Path) -> int:
         )
     local_path.write_bytes(r.content)
     return len(r.content)
+
+
+async def run_with_transient_retry(
+    submit: Callable[[], Awaitable[str]],
+    poll: Callable[[str], Awaitable[dict[str, Any]]],
+    *,
+    label: str = "task",
+    max_attempts: int | None = None,
+    backoff_s: float | None = None,
+    on_submit: Callable[[str], None] | None = None,
+) -> dict[str, Any]:
+    """Run submit() -> task_id, then poll(task_id) -> result task dict, retrying
+    the WHOLE cycle when poll raises MeshyTransientError (service_unavailable).
+
+    Each retry submits a fresh Meshy task (the blip rejects at 0%, so there's
+    nothing to resume). Non-transient failures propagate immediately — they'd
+    fail identically every attempt. `on_submit` is called with each task_id right
+    after submission (for mid-flight status/observability).
+
+    Defaults pull from settings.meshy_max_attempts / meshy_retry_backoff_s.
+    """
+    attempts = settings.meshy_max_attempts if max_attempts is None else max_attempts
+    backoff = settings.meshy_retry_backoff_s if backoff_s is None else backoff_s
+    last_exc: MeshyTransientError | None = None
+    for attempt in range(1, attempts + 1):
+        task_id = await submit()
+        if on_submit is not None:
+            on_submit(task_id)
+        try:
+            return await poll(task_id)
+        except MeshyTransientError as e:
+            last_exc = e
+            log.warning(
+                "meshy %s transient failure (attempt %d/%d): %s",
+                label, attempt, attempts, e,
+            )
+            if attempt < attempts:
+                await asyncio.sleep(backoff)
+    assert last_exc is not None  # loop runs >=1 time; only transient breaks out
+    raise last_exc
