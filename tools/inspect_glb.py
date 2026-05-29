@@ -52,10 +52,40 @@ def bv_bytes(gltf, bin_bytes, bv_idx):
     return bin_bytes[off : off + bv["byteLength"]]
 
 
+def dump_nodes(gltf):
+    """Dump scene-graph: node names, skin joints, head/eye-bone hits, bbox."""
+    nodes = gltf.get("nodes", [])
+    print("\n== scene graph ==")
+    print(f"buffers={len(gltf.get('buffers', []))} "
+          f"bufferViews={len(gltf.get('bufferViews', []))} "
+          f"accessors={len(gltf.get('accessors', []))} nodes={len(nodes)}")
+    hits = [(i, n.get("name", "")) for i, n in enumerate(nodes)
+            if any(k in (n.get("name", "") or "").lower()
+                   for k in ("head", "eye", "neck"))]
+    print(f"name hits (head/eye/neck): {hits}")
+    for si, sk in enumerate(gltf.get("skins", [])):
+        joints = sk.get("joints", [])
+        print(f"skin[{si}] joints={len(joints)} "
+              f"inverseBindMatrices=accessor[{sk.get('inverseBindMatrices')}] "
+              f"skeleton=node[{sk.get('skeleton')}]")
+        for j in joints:
+            nm = nodes[j].get("name", "") if j < len(nodes) else "?"
+            if any(k in nm.lower() for k in ("head", "eye", "neck")):
+                print(f"    joint node[{j}] '{nm}' "
+                      f"jointIndex={joints.index(j)}")
+    for m in gltf.get("meshes", []):
+        for p in m["primitives"]:
+            acc = gltf["accessors"][p["attributes"]["POSITION"]]
+            print(f"POSITION bbox min={acc.get('min')} max={acc.get('max')}")
+            break
+        break
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("glb", type=Path)
     ap.add_argument("--dump-tex", type=Path, default=None)
+    ap.add_argument("--nodes", action="store_true", help="dump scene-graph + skin joints")
     args = ap.parse_args()
 
     gltf, bin_bytes = parse_glb(args.glb.read_bytes())
@@ -115,6 +145,9 @@ def main():
             ext = "png" if fmt == "png" else "jpg"
             out = args.dump_tex / f"{args.glb.stem}_img{ii}.{ext}"
             out.write_bytes(b)
+
+    if args.nodes:
+        dump_nodes(gltf)
 
 
 if __name__ == "__main__":
