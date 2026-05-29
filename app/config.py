@@ -101,6 +101,15 @@ class Settings(BaseSettings):
     meshy_max_attempts: int = 3
     meshy_retry_backoff_s: float = 12.0
 
+    # Decimation (gltfpack) — runs on the retex GLB BEFORE Meshy rigging to drop
+    # Hunyuan's ~450-500k tris to ~80k (Quest walk-around stutter fix; validated
+    # 2026-05-29). DEFAULT OFF — opt-in until a full RunPod e2e confirms the
+    # front-end still flows into it; flip on after that. `-noq` is hardcoded in
+    # the helper (mandatory — quantization scrambles UVs on glTFast 6.18).
+    decimate_before_rigging: bool = False
+    decimation_ratio: float = 0.18          # gltfpack -si target (0.18 ≈ 452k→81k)
+    gltfpack_bin: str = "gltfpack"          # PATH name or absolute path to the binary
+
     host: str = "0.0.0.0"
     port: int = 8000
     log_level: str = "info"

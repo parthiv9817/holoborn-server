@@ -42,6 +42,7 @@ from app.services.runpod_client import (
     submit_job,
 )
 from app.services.view_synthesizer import synthesize_views_grid
+from app.services.decimation import decimate_glb
 
 # tools/graft_pbr_materials.py — restores PBR materials onto rigged GLB
 # (Meshy rigging strips the metallic/roughness/normal/emissive textures;
@@ -300,6 +301,37 @@ async def process_task(
                     p.unlink()
                 except OSError:
                     pass
+
+            # ── Decimation (optional, pre-rigging) ──────────────────────
+            # Drop Hunyuan's ~450-500k tris to ~80k BEFORE rigging so the
+            # skeleton is built on the low-poly mesh (clean skin weights) and
+            # the Quest walk-around stutter is fixed. We decimate final_path
+            # (the retex GLB) IN PLACE — both the rigging submit (retex_public_url
+            # below) and the graft (which uses final_path as PBR source) then
+            # transparently consume the decimated mesh, keeping UVs consistent.
+            # Graceful: if gltfpack fails/missing, decimate_glb returns False and
+            # we rig the full-res retex (no avatar lost). Default OFF until a full
+            # RunPod e2e confirms the front-end flows in (see settings).
+            if settings.decimate_before_rigging:
+                tdec = time.perf_counter()
+                decim_tmp = AVATARS_DIR / f"{task_id}_decim_tmp.glb"
+                ok = await asyncio.to_thread(
+                    decimate_glb, final_path, decim_tmp,
+                    settings.decimation_ratio, gltfpack_bin=settings.gltfpack_bin,
+                )
+                if ok:
+                    shutil.move(str(decim_tmp), str(final_path))
+                    task_record["decimated"] = True
+                    log.info(
+                        "[task %s] decimated retex pre-rigging elapsed=%.2fs",
+                        task_id, time.perf_counter() - tdec,
+                    )
+                else:
+                    task_record["decimated"] = False
+                    log.warning(
+                        "[task %s] decimation skipped/failed — rigging full-res retex",
+                        task_id,
+                    )
 
             # ── Phase 5: Meshy Rigging ──────────────────────────────────
             # The retex GLB is now at final_path = AVATARS_DIR / {task_id}.glb.
